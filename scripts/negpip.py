@@ -40,14 +40,14 @@ opt_hideui = getattr(shared.opts,OPT_HIDE, False)
 
 minusgetter = r'\(([^(:)]*):\s*-[\d]+(\.[\d]+)?(?:\s*)\)'
 
-class Script(modules.scripts.Script):   
+class Script(modules.scripts.Script):
     def __init__(self):
         self.active = False
         self.conds = None
         self.unconds = None
-        self.conlen = []   
+        self.conlen = []
         self.unlen = []
-        self.contokens = []   
+        self.contokens = []
         self.untokens = []
         self.hr = False
         self.x = None
@@ -55,7 +55,7 @@ class Script(modules.scripts.Script):
         self.ipa = None
 
         self.enable_rp_latent = False
-        
+
     def title(self):
         return "NegPiP"
 
@@ -65,7 +65,7 @@ class Script(modules.scripts.Script):
     infotext_fields = None
     paste_field_names = []
 
-    def ui(self, is_img2img):    
+    def ui(self, is_img2img):
         with gr.Accordion(f"NegPiP : {active_i if is_img2img else active_t}",open = False, visible = not opt_hideui) as acc:
             with gr.Row():
                 active = gr.Checkbox(value=False, label="Active",interactive=True)
@@ -79,7 +79,7 @@ class Script(modules.scripts.Script):
             data[key] = not data[key]
 
             with open(CONFIG, 'w', encoding="utf-8") as json_file:
-                json.dump(data, json_file, indent=4) 
+                json.dump(data, json_file, indent=4)
 
             return gr.update(value = f"Toggle startup Active(Now:{data[key]})")
 
@@ -114,7 +114,7 @@ class Script(modules.scripts.Script):
         self.active = active
         self.batch = p.batch_size
         self.isxl = hasattr(shared.sd_model,"conditioner")
-        
+
         self.rev = p.sampler_name in ["DDIM", "PLMS", "UniPC"]
         if forge: self.rev = not self.rev
 
@@ -158,7 +158,7 @@ class Script(modules.scripts.Script):
                     stepout.append([step,padtextweight])
                 output.append(stepout)
             return output
-        
+
         scheduled_p = prompt_parser.get_learned_conditioning_prompt_schedules(p.prompts,p.steps)
         scheduled_np = prompt_parser.get_learned_conditioning_prompt_schedules(p.negative_prompts,p.steps)
 
@@ -182,7 +182,7 @@ class Script(modules.scripts.Script):
                 if start is None: start = cond[0][0].cond[0:1,:] if not self.isxl else cond[0][0].cond["crossattn"][0:1,:]
                 if end is None: end = cond[0][0].cond[-1:,:] if not self.isxl else cond[0][0].cond["crossattn"][-1:,:]
                 token, tokenlen = tokenizer(target[0])
-                conds.append(cond[0][0].cond[1:tokenlen +2,:] if not self.isxl else cond[0][0].cond["crossattn"][1:tokenlen +2,:] ) 
+                conds.append(cond[0][0].cond[1:tokenlen +2,:] if not self.isxl else cond[0][0].cond["crossattn"][1:tokenlen +2,:] )
             conds = torch.cat(conds, 0)
 
             conds = torch.split(conds, 75, dim=0)
@@ -211,7 +211,7 @@ class Script(modules.scripts.Script):
                     stepconds.append([step,regionconds])
                 outconds.append(stepconds)
             return outconds
-            
+
         self.conds_all = calcconds(nip)
         self.unconds_all = calcconds(pin)
 
@@ -222,7 +222,7 @@ class Script(modules.scripts.Script):
         #print(self.unconds_all)
 
         resetpcache(p)
-        
+
         def calcsets(A, B):
             return A // B if A % B == 0 else A // B + 1
 
@@ -232,12 +232,12 @@ class Script(modules.scripts.Script):
         if not flag:
             self.active = False
             unload(self,p)
-            return   
+            return
 
         if not hasattr(self,"negpip_dr_callbacks"):
             self.negpip_dr_callbacks = on_cfg_denoiser(self.denoiser_callback)
 
-        #disable hookforward if hookfoward in regional prompter is eanble. 
+        #disable hookforward if hookfoward in regional prompter is eanble.
         #negpip operation is treated in regional prompter
 
         already_hooked = False
@@ -256,14 +256,14 @@ class Script(modules.scripts.Script):
         unload(self,p)
         self.conds_all = None
         self.unconds_all = None
-    
+
     def denoiser_callback(self, params: CFGDenoiserParams):
         if debug: print(params.text_cond.shape)
         if self.active:
             if self.x is None: self.x = params.x.shape
             if self.x != params.x.shape: self.hr = True
 
-            self.latenti = 0 
+            self.latenti = 0
 
             condslist = []
             tokenslist = []
@@ -303,20 +303,20 @@ def unload(self,p):
 def hook_forward(self, module):
     def forward(x, context=None, mask=None, additional_tokens=None, n_times_crossframe_attn_in_self=0, value = None, transformer_options=None):
         if debug: print(" x.shape:",x.shape,"context.shape:",context.shape,"self.contokens",self.contokens,"self.untokens",self.untokens)
-        
+
         def sub_forward(x, context, mask, additional_tokens, n_times_crossframe_attn_in_self,conds,contokens,unconds,untokens, latent = None):
             if debug: print(" x.shape[0]:",x.shape[0],"batch:",self.batch *2)
-            
+
             if x.shape[0] == self.batch *2:
                 if debug: print(" x.shape[0] == self.batch *2")
-            
+
                 if self.rev:
                     contn,contp = context.chunk(2)
                     ixn,ixp = x.chunk(2)
                 else:
                     contp,contn =  context.chunk(2)
                     ixp,ixn = x.chunk(2)  #x[0:self.batch,:,:],x[self.batch:,:,:]
-                
+
                 if conds is not None:
                     if contp.shape[0] != conds.shape[0]:
                         conds = conds.expand(contp.shape[0],-1,-1)
@@ -327,7 +327,7 @@ def hook_forward(self, module):
                     contn =  torch.cat((contn,unconds),1)
                 xp = main_foward(self, module, ixp,contp,mask,additional_tokens,n_times_crossframe_attn_in_self,contokens)
                 xn = main_foward(self, module, ixn,contn,mask,additional_tokens,n_times_crossframe_attn_in_self,untokens)
-            
+
                 out = torch.cat([xn,xp]) if self.rev else torch.cat([xp,xn])
                 return out
 
@@ -341,7 +341,7 @@ def hook_forward(self, module):
                     if context.shape[0] != conds.shape[0]:
                         conds = conds.expand(context.shape[0],-1,-1)
                     context = torch.cat([context,conds],1)
-                
+
                 tokens = contokens if contokens is not None else untokens
 
                 out = main_foward(self, module, x,context,mask,additional_tokens,n_times_crossframe_attn_in_self,tokens)
@@ -383,7 +383,7 @@ def hook_forward(self, module):
                 return sub_forward(x, context, mask, additional_tokens, n_times_crossframe_attn_in_self,self.conds[0],self.contokens[0],self.unconds[0],self.untokens[0])
             else:
                 return sub_forward(x, context, mask, additional_tokens, n_times_crossframe_attn_in_self,None,None,None,None)
-    
+
     return forward
 
 count = 0
@@ -423,7 +423,7 @@ def main_foward(self, module, x, context, mask, additional_tokens, n_times_cross
             for token in tokens:
                 start = (v.shape[1]//77 - len(tokens)) * 77
                 #print("v.shape:",v.shape,"start:",start+1,"stop:",start+token)
-                v[:,start+1:start+token,:] = -v[:,start+1:start+token,:] 
+                v[:,start+1:start+token,:] = -v[:,start+1:start+token,:]
 
     if atm.exists(mask):
         mask = atm.rearrange(mask, 'b ... -> b (...)')
