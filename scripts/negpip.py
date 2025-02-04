@@ -1,205 +1,121 @@
-import json
 import re
 
-import gradio as gr
-import modules
-import modules.ui
 import torch
-from ldm_patched.ldm.modules.attention import default
-from modules import devices, prompt_parser, shared
-from modules.script_callbacks import CFGDenoiserParams, on_cfg_denoiser, on_ui_settings
+from ldm_patched.ldm.modules.attention import default, optimized_attention
+from modules import scripts
+from modules.prompt_parser import (
+    get_learned_conditioning,
+    get_learned_conditioning_prompt_schedules,
+)
+from modules.script_callbacks import CFGDenoiserParams, on_cfg_denoiser
 
-OPT_ACT = "negpip_active"
-OPT_HIDE = "negpip_hide"
-
-NEGPIP_T = "customscript/negpip.py/txt2img/Active/value"
-NEGPIP_I = "customscript/negpip.py/img2img/Active/value"
-CONFIG = shared.cmd_opts.ui_config_file
-
-with open(CONFIG, "r", encoding="utf-8") as json_file:
-    ui_config = json.load(json_file)
-
-startup_t = ui_config[NEGPIP_T] if NEGPIP_T in ui_config else None
-startup_i = ui_config[NEGPIP_I] if NEGPIP_I in ui_config else None
-active_t = "Active" if startup_t else "Not Active"
-active_i = "Active" if startup_i else "Not Active"
-
-opt_active = getattr(shared.opts, OPT_ACT, True)
-opt_hideui = getattr(shared.opts, OPT_HIDE, False)
-
-minusgetter = r"\(([^(:)]*):\s*-[\d]+(\.[\d]+)?(?:\s*)\)"
+neg_pattern = r"\([^\(\:\)]+\:\s*\-\d+(?:\.[\d]+)?\s*\)"
 
 
-class Script(modules.scripts.Script):
+class NegPiP(scripts.Script):
     def __init__(self):
-        self.active = False
+        self.active = True
+
         self.conds = None
+        self.c_len = []
+        self.c_tokens = []
+
         self.unconds = None
-        self.conlen = []
-        self.unlen = []
-        self.contokens = []
-        self.untokens = []
+        self.uc_len = []
+        self.uc_tokens = []
+
         self.hr = False
         self.x = None
-
-        self.ipa = None
-
-        self.enable_rp_latent = False
 
     def title(self):
         return "NegPiP"
 
     def show(self, is_img2img):
-        return modules.scripts.AlwaysVisible
-
-    infotext_fields = None
-    paste_field_names = []
+        return scripts.AlwaysVisible
 
     def ui(self, is_img2img):
-        with gr.Accordion(
-            f"NegPiP : {active_i if is_img2img else active_t}",
-            open=False,
-            visible=not opt_hideui,
-        ) as acc:
-            with gr.Row():
-                active = gr.Checkbox(value=False, label="Active", interactive=True)
-                toggle = gr.Button(
-                    elem_id="switch_default",
-                    value=f"Toggle startup with Active(Now:{startup_i if is_img2img else startup_t})",
-                    variant="primary",
-                )
+        return None
 
-        def f_toggle(is_img2img):
-            key = NEGPIP_I if is_img2img else NEGPIP_T
-
-            with open(CONFIG, "r", encoding="utf-8") as json_file:
-                data = json.load(json_file)
-            data[key] = not data[key]
-
-            with open(CONFIG, "w", encoding="utf-8") as json_file:
-                json.dump(data, json_file, indent=4)
-
-            return gr.update(value=f"Toggle startup Active(Now:{data[key]})")
-
-        toggle.click(
-            fn=f_toggle,
-            inputs=[gr.Checkbox(value=is_img2img, visible=False)],
-            outputs=[toggle],
-        )
-        active.change(
-            fn=lambda x: gr.update(label=f"NegPiP : {'Active' if x else 'Not Active'}"),
-            inputs=active,
-            outputs=[acc],
-        )
-
-        self.infotext_fields = [
-            (active, "NegPiP Active"),
-        ]
-
-        for _, name in self.infotext_fields:
-            self.paste_field_names.append(name)
-
-        return [active]
-
-    def process_batch(self, p, active, **kwargs):
+    def process_batch(self, p, *args, **kwargs):
         self.__init__()
         flag = False
 
-        if getattr(shared.opts, OPT_HIDE, False) and not getattr(
-            shared.opts, OPT_ACT, False
-        ):
-            return
-        elif not active:
-            return
-
-        self.rpscript = None
-        # get information of regponal prompter
-        from modules.scripts import scripts_txt2img
-
-        for script in scripts_txt2img.alwayson_scripts:
-            if "rp.py" in script.filename:
-                self.rpscript = script
-
         self.hrp, self.hrn = hr_dealer(p)
 
-        self.active = active
         self.batch = p.batch_size
         self.isxl = p.sd_model.is_sdxl
         self.rev = p.sampler_name not in ["DDIM", "PLMS", "UniPC"]
 
         tokenizer = (
-            shared.sd_model.conditioner.embedders[0].tokenize_line
+            p.sd_model.conditioner.embedders[0].tokenize_line
             if self.isxl
-            else shared.sd_model.cond_stage_model.tokenize_line
+            else p.sd_model.cond_stage_model.tokenize_line
         )
 
-        def getshedulednegs(scheduled, prompts):
+        def getScheduledNegs(scheduled, prompts):
             output = []
             nonlocal flag
+
             for i, batch_schedule in enumerate(scheduled):
                 stepout = []
                 seps = None
-                if self.rpscript:
-                    if hasattr(self.rpscript, "seps"):
-                        seps = self.rpscript.seps
-                    self.enable_rp_latent = seps == "AND"
 
                 for step, prompt in batch_schedule:
                     sep_prompts = prompt.split(seps) if seps else [prompt]
                     pad = 0
                     padtextweight = []
                     for sep_prompt in sep_prompts:
-                        minusmatches = re.finditer(minusgetter, sep_prompt)
-                        minus_targets = []
-                        textweights = []
-                        for minusmatch in minusmatches:
-                            minus_targets.append(
-                                minusmatch.group().replace("(", "").replace(")", "")
-                            )
-
-                            prompts[i] = prompts[i].replace(minusmatch.group(), "")
-                        minus_targets = [x.split(":") for x in minus_targets]
-                        for text, weight in minus_targets:
-                            weight = float(weight)
-                            if text == "BREAK":
+                        neg_matches = re.findall(neg_pattern, sep_prompt)
+                        neg_targets = []
+                        text_weights = []
+                        for minusmatch in neg_matches:
+                            neg_targets.append(minusmatch.strip("(").strip(")"))
+                            prompts[i] = prompts[i].replace(minusmatch, "")
+                        neg_targets = [x.split(":") for x in neg_targets]
+                        for text, weight in neg_targets:
+                            if text.strip() in ("BREAK", "AND"):
                                 continue
-                            if weight < 0:
-                                textweights.append([text, weight])
+                            weight = float(weight)
+                            if weight < 0.0:
+                                text_weights.append([text, weight])
                                 flag = True
-                        padtextweight.append([pad, textweights])
+                        padtextweight.append([pad, text_weights])
                         tokens, tokensnum = tokenizer(sep_prompt)
                         pad = tokensnum // 75 + 1 + pad
                     stepout.append([step, padtextweight])
                 output.append(stepout)
             return output
 
-        scheduled_p = prompt_parser.get_learned_conditioning_prompt_schedules(
-            p.prompts, p.steps
-        )
-        scheduled_np = prompt_parser.get_learned_conditioning_prompt_schedules(
+        scheduled_p = get_learned_conditioning_prompt_schedules(p.prompts, p.steps)
+        scheduled_np = get_learned_conditioning_prompt_schedules(
             p.negative_prompts, p.steps
         )
 
         if self.hrp:
-            scheduled_hr_p = prompt_parser.get_learned_conditioning_prompt_schedules(
+            scheduled_hr_p = get_learned_conditioning_prompt_schedules(
                 p.hr_prompts,
                 p.hr_second_pass_steps if p.hr_second_pass_steps > 0 else p.steps,
             )
         if self.hrn:
-            scheduled_hr_np = prompt_parser.get_learned_conditioning_prompt_schedules(
+            scheduled_hr_np = get_learned_conditioning_prompt_schedules(
                 p.hr_negative_prompts,
                 p.hr_second_pass_steps if p.hr_second_pass_steps > 0 else p.steps,
             )
 
-        nip = getshedulednegs(scheduled_p, p.prompts)
-        pin = getshedulednegs(scheduled_np, p.negative_prompts)
+        nip = getScheduledNegs(scheduled_p, p.prompts)
+        pin = getScheduledNegs(scheduled_np, p.negative_prompts)
 
         if self.hrp:
-            hr_nip = getshedulednegs(scheduled_hr_p, p.hr_prompts)
+            hr_nip = getScheduledNegs(scheduled_hr_p, p.hr_prompts)
         if self.hrn:
-            hr_pin = getshedulednegs(scheduled_hr_np, p.hr_negative_prompts)
+            hr_pin = getScheduledNegs(scheduled_hr_np, p.hr_negative_prompts)
 
-        def conddealer(targets):
+        if not flag:
+            self.active = False
+            unload(self, p)
+            return
+
+        def cond_dealer(targets):
             conds = []
             start = None
             end = None
@@ -207,10 +123,7 @@ class Script(modules.scripts.Script):
                 input = SdConditioning(
                     [f"({target[0]}:{-target[1]})"], width=p.width, height=p.height
                 )
-                with devices.autocast():
-                    cond = prompt_parser.get_learned_conditioning(
-                        shared.sd_model, input, p.steps
-                    )
+                cond = get_learned_conditioning(p.sd_model, input, p.steps)
                 if start is None:
                     start = (
                         cond[0][0].cond[0:1, :]
@@ -233,7 +146,7 @@ class Script(modules.scripts.Script):
             conds = conds.unsqueeze(0)
             return conds.repeat(self.batch, 1, 1), conds.shape[1]
 
-        def calcconds(targetlist):
+        def calc_conds(targetlist):
             outconds = []
             for batch in targetlist:
                 stepconds = []
@@ -241,57 +154,48 @@ class Script(modules.scripts.Script):
                     regionconds = []
                     for region, targets in regions:
                         if targets:
-                            conds, contokens = conddealer(targets)
-                            regionconds.append([region, conds, contokens])
+                            conds, c_tokens = cond_dealer(targets)
+                            regionconds.append([region, conds, c_tokens])
                         else:
                             regionconds.append([region, None, None])
                     stepconds.append([step, regionconds])
                 outconds.append(stepconds)
             return outconds
 
-        self.conds_all = calcconds(nip)
-        self.unconds_all = calcconds(pin)
+        self.conds_all = calc_conds(nip)
+        self.unconds_all = calc_conds(pin)
 
         if self.hrp:
-            self.hr_conds_all = calcconds(hr_nip)
+            self.hr_conds_all = calc_conds(hr_nip)
         if self.hrn:
-            self.hr_unconds_all = calcconds(hr_pin)
+            self.hr_unconds_all = calc_conds(hr_pin)
 
         resetpcache(p)
 
-        def calcsets(A, B):
+        def calcSets(A, B):
             return A // B if A % B == 0 else A // B + 1
 
-        self.conlen = calcsets(tokenizer(p.prompts[0])[1], 75)
-        self.unlen = calcsets(tokenizer(p.negative_prompts[0])[1], 75)
-
-        if not flag:
-            self.active = False
-            unload(self, p)
-            return
+        self.c_len = calcSets(tokenizer(p.prompts[0])[1], 75)
+        self.uc_len = calcSets(tokenizer(p.negative_prompts[0])[1], 75)
 
         if not hasattr(self, "negpip_dr_callbacks"):
             self.negpip_dr_callbacks = on_cfg_denoiser(self.denoiser_callback)
 
-        # disable hookforward if hookfoward in regional prompter is enable.
-        # negpip operation is treated in regional prompter
-
-        already_hooked = False
-        if self.rpscript is not None and hasattr(self.rpscript, "hooked"):
-            already_hooked = self.rpscript.hooked
-
-        if not already_hooked:
-            self.handle = hook_forwards(self, p.sd_model.model.diffusion_model)
+        self.handle = hook_forwards(self, p.sd_model.model.diffusion_model)
 
         print(
-            f"NegPiP enable, Positive:{self.conds_all[0][0][1][0][2]},Negative:{self.unconds_all[0][0][1][0][2]}"
+            "\n".join(
+                [
+                    "",
+                    "NegPiP Enable",
+                    f" - Positive: {self.conds_all[0][0][1][0][2]}",
+                    f" - Negative: {self.unconds_all[0][0][1][0][2]}",
+                    "",
+                ]
+            )
         )
 
-        p.extra_generation_params.update(
-            {
-                "NegPiP Active": active,
-            }
-        )
+        p.extra_generation_params["NegPiP"] = True
 
     def postprocess(self, p, processed, *args):
         unload(self, p)
@@ -299,40 +203,41 @@ class Script(modules.scripts.Script):
         self.unconds_all = None
 
     def denoiser_callback(self, params: CFGDenoiserParams):
-        if self.active:
-            if self.x is None:
-                self.x = params.x.shape
-            if self.x != params.x.shape:
-                self.hr = True
+        if not self.active:
+            return
 
-            self.latenti = 0
+        if self.x is None:
+            self.x = params.x.shape
+        if self.x != params.x.shape:
+            self.hr = True
 
-            condslist = []
-            tokenslist = []
-            conds = self.hr_conds_all if self.hrp and self.hr else self.conds_all
-            if conds is not None:
-                for step, regions in conds[0]:
-                    if step >= params.sampling_step + 2:
-                        for region, conds, tokens in regions:
-                            condslist.append(conds)
-                            tokenslist.append(tokens)
+        conds_list = []
+        tokens_list = []
+
+        conds = self.hr_conds_all if self.hr and self.hrp else self.conds_all
+        if conds is not None:
+            for step, regions in conds[0]:
+                if step >= params.sampling_step + 2:
+                    for region, conds, tokens in regions:
+                        conds_list.append(conds)
+                        tokens_list.append(tokens)
+                    break
+            self.conds = conds_list
+            self.c_tokens = tokens_list
+
+        unconds_list = []
+        uc_tokens_list = []
+
+        unconds = self.hr_unconds_all if self.hr and self.hrn else self.unconds_all
+        if unconds is not None:
+            for step, regions in unconds[0]:
+                if step >= params.sampling_step + 2:
+                    for region, unconds, uc_tokens in regions:
+                        unconds_list.append(unconds)
+                        uc_tokens_list.append(uc_tokens)
                         break
-                self.conds = condslist
-                self.contokens = tokenslist
-
-            uncondslist = []
-            untokenslist = []
-            unconds = self.hr_unconds_all if self.hrn and self.hr else self.unconds_all
-            if unconds is not None:
-                for step, regions in unconds[0]:
-                    if step >= params.sampling_step + 2:
-                        for region, unconds, untokens in regions:
-                            uncondslist.append(unconds)
-                            untokenslist.append(untokens)
-                            break
-
-                self.unconds = uncondslist
-                self.untokens = untokenslist
+            self.unconds = unconds_list
+            self.uc_tokens = uc_tokens_list
 
 
 def unload(self, p):
@@ -343,7 +248,13 @@ def unload(self, p):
 
 def hook_forward(self, module):
     def forward(
-        x, context=None, mask=None, value=None, additional_tokens=None, *args, **kwargs
+        x,
+        context=None,
+        mask=None,
+        value=None,
+        additional_tokens=None,
+        *args,
+        **kwargs,
     ):
         def sub_forward(
             x,
@@ -351,9 +262,9 @@ def hook_forward(self, module):
             mask,
             additional_tokens,
             conds,
-            contokens,
+            c_tokens,
             unconds,
-            untokens,
+            uc_tokens,
             latent=None,
         ):
             if x.shape[0] == self.batch * 2:
@@ -381,7 +292,7 @@ def hook_forward(self, module):
                     value,
                     mask,
                     additional_tokens,
-                    contokens,
+                    c_tokens,
                     args,
                     kwargs,
                 )
@@ -393,7 +304,7 @@ def hook_forward(self, module):
                     value,
                     mask,
                     additional_tokens,
-                    untokens,
+                    uc_tokens,
                     args,
                     kwargs,
                 )
@@ -411,9 +322,9 @@ def hook_forward(self, module):
                         conds = conds.expand(context.shape[0], -1, -1)
                     context = torch.cat([context, conds], 1)
 
-                tokens = contokens if contokens is not None else untokens
+                tokens = c_tokens if c_tokens is not None else uc_tokens
 
-                out = main_forward(
+                return main_forward(
                     self,
                     module,
                     x,
@@ -425,24 +336,23 @@ def hook_forward(self, module):
                     args,
                     kwargs,
                 )
-                return out
 
             else:
                 tokens = []
                 concon = counter(self.isxl)
-                if context.shape[1] == self.conlen * 77 and concon:
+                if context.shape[1] == self.c_len * 77 and concon:
                     if conds is not None:
                         if context.shape[0] != conds.shape[0]:
                             conds = conds.expand(context.shape[0], -1, -1)
                         context = torch.cat([context, conds], 1)
-                        tokens = contokens
-                elif context.shape[1] == self.unlen * 77 and concon:
+                        tokens = c_tokens
+                elif context.shape[1] == self.uc_len * 77 and concon:
                     if unconds is not None:
                         if context.shape[0] != unconds.shape[0]:
                             unconds = unconds.expand(context.shape[0], -1, -1)
                         context = torch.cat([context, unconds], 1)
-                        tokens = untokens
-                out = main_forward(
+                        tokens = uc_tokens
+                return main_forward(
                     self,
                     module,
                     x,
@@ -454,57 +364,27 @@ def hook_forward(self, module):
                     args,
                     kwargs,
                 )
-                return out
 
-        if self.enable_rp_latent:
-            if len(self.conds) - 1 >= self.latenti:
-                out = sub_forward(
-                    x,
-                    context,
-                    mask,
-                    additional_tokens,
-                    self.conds[self.latenti],
-                    self.contokens[self.latenti],
-                    None,
-                    None,
-                    latent=True,
-                )
-                self.latenti += 1
-            else:
-                out = sub_forward(
-                    x,
-                    context,
-                    mask,
-                    additional_tokens,
-                    None,
-                    None,
-                    self.unconds[0],
-                    self.untokens[0],
-                    latent=False,
-                )
-                self.latenti = 0
-            return out
+        if (
+            self.conds is not None
+            and self.unconds is not None
+            and len(self.conds) > 0
+            and len(self.unconds) > 0
+        ):
+            return sub_forward(
+                x,
+                context,
+                mask,
+                additional_tokens,
+                self.conds[0],
+                self.c_tokens[0],
+                self.unconds[0],
+                self.uc_tokens[0],
+            )
         else:
-            if (
-                self.conds is not None
-                and self.unconds is not None
-                and len(self.conds) > 0
-                and len(self.unconds) > 0
-            ):
-                return sub_forward(
-                    x,
-                    context,
-                    mask,
-                    additional_tokens,
-                    self.conds[0],
-                    self.contokens[0],
-                    self.unconds[0],
-                    self.untokens[0],
-                )
-            else:
-                return sub_forward(
-                    x, context, mask, additional_tokens, None, None, None, None
-                )
+            return sub_forward(
+                x, context, mask, additional_tokens, None, None, None, None
+            )
 
     return forward
 
@@ -552,35 +432,16 @@ def main_forward(
         if tokens:
             v[:, -tokens:, :] = -v[:, -tokens:, :]
 
-    out = attention_function(q, k, v, attn.heads, mask)
+    out = optimized_attention(q, k, v, attn.heads, mask)
     return attn.to_out(out)
-
-
-def attention_function(
-    q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False
-):
-    if skip_reshape:
-        b, _, _, dim_head = q.shape
-    else:
-        b, _, dim_head = q.shape
-        dim_head //= heads
-        q, k, v = map(
-            lambda t: t.view(b, -1, heads, dim_head).transpose(1, 2),
-            (q, k, v),
-        )
-
-    out = torch.nn.functional.scaled_dot_product_attention(
-        q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False
-    )
-    out = out.transpose(1, 2).reshape(b, -1, heads * dim_head)
-    return out
 
 
 def hook_forwards(self, root_module: torch.nn.Module, remove=False):
     for name, module in root_module.named_modules():
         if "attn2" in name and module.__class__.__name__ == "CrossAttention":
-            module.forward = hook_forward(self, module)
-            if remove:
+            if not remove:
+                module.forward = hook_forward(self, module)
+            else:
                 del module.forward
 
 
@@ -593,7 +454,12 @@ def resetpcache(p):
 
 class SdConditioning(list):
     def __init__(
-        self, prompts, is_negative_prompt=False, width=None, height=None, copy_from=None
+        self,
+        prompts,
+        is_negative_prompt=False,
+        width=None,
+        height=None,
+        copy_from=None,
     ):
         super().__init__()
         self.extend(prompts)
@@ -606,27 +472,6 @@ class SdConditioning(list):
         )
         self.width = width or getattr(copy_from, "width", None)
         self.height = height or getattr(copy_from, "height", None)
-
-
-def ext_on_ui_settings():
-    # [setting_name], [default], [label], [component(blank is checkbox)], [component_args]debug_level_choices = []
-    negpip_options = [
-        (OPT_HIDE, False, "Hide in Txt2Img/Img2Img tab(Reload UI required)"),
-        (
-            OPT_ACT,
-            True,
-            "Active(Effective when Hide is Checked)",
-        ),
-    ]
-    section = ("negpip", "NegPiP")
-
-    for cur_setting_name, *option_info in negpip_options:
-        shared.opts.add_option(
-            cur_setting_name, shared.OptionInfo(*option_info, section=section)
-        )
-
-
-on_ui_settings(ext_on_ui_settings)
 
 
 def hr_dealer(p):
