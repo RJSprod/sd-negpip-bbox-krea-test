@@ -1,11 +1,5 @@
 import re
 
-from modules import scripts
-from modules.prompt_parser import get_learned_conditioning
-from modules.prompt_parser import get_learned_conditioning_prompt_schedules as get_ps
-from modules.script_callbacks import CFGDenoiserParams, on_cfg_denoiser
-from torch import cat
-
 from lib_negpip.utils import (
     SdConditioning,
     hook_forwards,
@@ -13,12 +7,21 @@ from lib_negpip.utils import (
     resetpcache,
     unload,
 )
+from torch import cat
+
+from modules import scripts
+from modules.prompt_parser import get_learned_conditioning
+from modules.prompt_parser import get_learned_conditioning_prompt_schedules as get_ps
+from modules.script_callbacks import CFGDenoiserParams, on_cfg_denoiser
 
 neg_pattern = r"\([^\(\:\)]+\:\s*\-\d+(?:\.[\d]+)?\s*\)"
 
 
 class NegPiP(scripts.Script):
     def __init__(self):
+        self.reset()
+
+    def reset(self):
         self.active = True
 
         self.conds = None
@@ -42,7 +45,7 @@ class NegPiP(scripts.Script):
         return None
 
     def process_batch(self, p, *args, **kwargs):
-        self.__init__()
+        self.reset()
         flag = False
 
         self.hrp, self.hrn = hr_dealer(p)

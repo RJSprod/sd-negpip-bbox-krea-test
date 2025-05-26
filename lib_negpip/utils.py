@@ -1,6 +1,7 @@
 from typing import TYPE_CHECKING
 
 import torch
+
 from ldm_patched.ldm.modules.attention import default, optimized_attention
 
 if TYPE_CHECKING:
@@ -62,6 +63,7 @@ def hr_dealer(p: "StableDiffusionProcessing"):
 
 
 def __hook_forward(cls: "NegPiP", module):
+    @torch.inference_mode()
     def forward(
         x,
         context=None,
@@ -71,6 +73,7 @@ def __hook_forward(cls: "NegPiP", module):
         *args,
         **kwargs,
     ):
+        @torch.inference_mode()
         def sub_forward(
             x,
             context,
@@ -228,6 +231,7 @@ def __counter(isxl: bool):
     return outpn
 
 
+@torch.inference_mode()
 def __main_forward(
     cls: "NegPiP",
     attn,
