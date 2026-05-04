@@ -1,7 +1,7 @@
 import re
 
+from lib_negpip import IS_NEO
 from lib_negpip.utils import (
-    SdConditioning,
     hook_forwards,
     hr_dealer,
     resetpcache,
@@ -10,7 +10,7 @@ from lib_negpip.utils import (
 from torch import cat
 
 from modules import scripts
-from modules.prompt_parser import get_learned_conditioning
+from modules.prompt_parser import SdConditioning, get_learned_conditioning
 from modules.prompt_parser import get_learned_conditioning_prompt_schedules as get_ps
 from modules.script_callbacks import CFGDenoiserParams, on_cfg_denoiser
 
@@ -54,11 +54,18 @@ class NegPiP(scripts.Script):
         self.isxl = p.sd_model.is_sdxl
         self.rev = p.sampler_name not in ("DDIM", "PLMS", "UniPC")
 
-        tokenizer = (
-            p.sd_model.conditioner.embedders[0].tokenize_line
-            if self.isxl
-            else p.sd_model.cond_stage_model.tokenize_line
-        )
+        if IS_NEO:
+            tokenizer = (
+                p.sd_model.text_processing_engine_l.tokenize_line
+                if self.isxl
+                else p.sd_model.text_processing_engine.tokenize_line
+            )
+        else:
+            tokenizer = (
+                p.sd_model.conditioner.embedders[0].tokenize_line
+                if self.isxl
+                else p.sd_model.cond_stage_model.tokenize_line
+            )
 
         def getScheduledNegs(scheduled, prompts):
             output = []
@@ -197,18 +204,11 @@ class NegPiP(scripts.Script):
         if not hasattr(self, "negpip_dr_callbacks"):
             self.negpip_dr_callbacks = on_cfg_denoiser(self.denoiser_callback)
 
-        self.handle = hook_forwards(self, p.sd_model.model.diffusion_model)
+        unet = p.sd_model.forge_objects.unet.model.diffusion_model
+        self.handle = hook_forwards(self, unet)
 
         print(
-            "\n".join(
-                [
-                    "",
-                    "NegPiP Enable",
-                    f" - Positive: {self.conds_all[0][0][1][0][2]}",
-                    f" - Negative: {self.unconds_all[0][0][1][0][2]}",
-                    "",
-                ]
-            )
+            f"NegPiP Enable (Positive: {self.conds_all[0][0][1][0][2]} ; Negative: {self.unconds_all[0][0][1][0][2]})"
         )
 
         p.extra_generation_params["NegPiP"] = True

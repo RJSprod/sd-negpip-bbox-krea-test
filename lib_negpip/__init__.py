@@ -1,6 +1,6 @@
 """
 Copyright (C) 2025 hako-mikan
-Copyright (C) 2025 Haoming02
+Copyright (C) 2026 Haoming02
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU Affero General Public License as published
@@ -15,3 +15,10 @@ GNU Affero General Public License for more details.
 You should have received a copy of the GNU Affero General Public License
 along with this program. If not, see <https://www.gnu.org/licenses/>.
 """
+
+try:
+    from backend import shared
+except ImportError:
+    IS_NEO = False
+else:
+    IS_NEO = True

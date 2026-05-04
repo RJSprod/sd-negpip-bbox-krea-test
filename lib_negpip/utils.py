@@ -1,34 +1,18 @@
 from typing import TYPE_CHECKING
 
-import torch
-
-from ldm_patched.ldm.modules.attention import default, optimized_attention
-
 if TYPE_CHECKING:
-    from modules.processing import StableDiffusionProcessing
     from scripts.negpip import NegPiP
 
+    from modules.processing import StableDiffusionProcessing
 
-class SdConditioning(list):
-    def __init__(
-        self,
-        prompts,
-        is_negative_prompt=False,
-        width=None,
-        height=None,
-        copy_from=None,
-    ):
-        super().__init__()
-        self.extend(prompts)
+import torch
 
-        if copy_from is None:
-            copy_from = prompts
+from lib_negpip import IS_NEO
 
-        self.is_negative_prompt = is_negative_prompt or getattr(
-            copy_from, "is_negative_prompt", False
-        )
-        self.width = width or getattr(copy_from, "width", None)
-        self.height = height or getattr(copy_from, "height", None)
+if IS_NEO:
+    from backend.attention import attention_function as optimized_attention
+else:
+    from ldm_patched.ldm.modules.attention import optimized_attention
 
 
 def hook_forwards(cls: "NegPiP", root_module: torch.nn.Module, remove=False):
@@ -42,15 +26,18 @@ def hook_forwards(cls: "NegPiP", root_module: torch.nn.Module, remove=False):
 
 def unload(cls: "NegPiP", p: "StableDiffusionProcessing"):
     if hasattr(cls, "handle"):
-        hook_forwards(cls, p.sd_model.model.diffusion_model, remove=True)
+        unet = p.sd_model.forge_objects.unet.model.diffusion_model
+        hook_forwards(cls, unet, remove=True)
         del cls.handle
 
 
 def resetpcache(p: "StableDiffusionProcessing"):
-    p.cached_c = [None, None]
-    p.cached_uc = [None, None]
-    p.cached_hr_c = [None, None]
-    p.cached_hr_uc = [None, None]
+    c = 3 if IS_NEO else 2
+    p.cached_c = [None] * c
+    p.cached_uc = [None] * c
+    if hasattr(p, "cached_hr_c"):
+        p.cached_hr_c = [None] * c
+        p.cached_hr_uc = [None] * c
 
 
 def hr_dealer(p: "StableDiffusionProcessing"):
@@ -246,7 +233,6 @@ def __main_forward(
 ):
     q = attn.to_q(x)
     context = context.to(x.dtype)
-    context = default(context, x)
     k = attn.to_k(context)
     if value is not None:
         v = attn.to_v(value)
