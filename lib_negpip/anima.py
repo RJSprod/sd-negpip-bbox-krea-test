@@ -1,0 +1,239 @@
+# https://github.com/david419kr/sd-webui-negpip/blob/main/scripts/negpip.py
+
+from functools import wraps
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from scripts.negpip import NegPiP
+
+    from backend.diffusion_engine.anima import Anima as AnimaEngine
+    from backend.nn.anima import Anima
+    from backend.text_processing.anima_engine import AnimaTextProcessingEngine
+    from modules.processing import StableDiffusionProcessing
+    from modules.prompt_parser import SdConditioning
+
+import torch
+import torch.nn.functional as F
+from einops import rearrange
+
+from backend.sampling import condition, sampling_function
+
+
+def hook_anima(p: "StableDiffusionProcessing"):
+    _hook_get_learned_conditioning(p.sd_model)
+    _hook_dit_forward(p.sd_model.forge_objects.unet.model.diffusion_model)
+    _hook_forwards(p.sd_model.forge_objects.unet.model.diffusion_model)
+    _hook_compile_conditions()
+
+
+def unload_a(cls: "NegPiP", p: "StableDiffusionProcessing"):
+    if hasattr(cls, "handle_a"):
+        dit = p.sd_model.forge_objects.unet.model.diffusion_model
+
+        p.sd_model.get_learned_conditioning = p.sd_model.orig_forward
+        del p.sd_model.orig_forward
+
+        dit.forward = dit.orig_forward
+        del dit.orig_forward
+
+        condition.compile_conditions = condition.orig_forward
+        sampling_function.compile_conditions = condition.orig_forward
+        del condition.orig_forward
+
+        _hook_forwards(dit, remove=True)
+        del cls.handle_a
+
+
+def _hook_get_learned_conditioning(model: "AnimaEngine"):
+    engine: "AnimaTextProcessingEngine" = model.text_processing_engine_anima
+
+    model.orig_forward = model.get_learned_conditioning
+
+    @torch.inference_mode()
+    @wraps(model.orig_forward)
+    def get_learned_conditioning(prompt: "SdConditioning"):
+        conds = model.orig_forward(prompt)
+        if not isinstance(conds, list):
+            return conds
+
+        prompt_lines = list(prompt)
+        if len(prompt_lines) != len(conds):
+            return conds
+
+        crossattn = []
+        negpip_mask = []
+        _count = 0
+
+        for line, cond in zip(prompt_lines, conds):
+            if not isinstance(cond, torch.Tensor):
+                return conds
+
+            cond_data = cond.reshape(-1, cond.shape[-1]) if cond.ndim > 2 else cond
+            if cond_data.ndim != 2:
+                return conds
+
+            mask = _build_negpip_mask(
+                engine,
+                line,
+                cond_data.shape[0],
+                cond_data.device,
+                cond_data.dtype,
+            )
+
+            _count += int((mask < 0).sum())
+
+            crossattn.append(cond_data * mask.unsqueeze(-1).to(cond_data))
+            negpip_mask.append(mask.unsqueeze(-1).to(cond_data))
+
+        if _count > 0:
+            key = "Negative" if prompt.is_negative_prompt else "Positive"
+            print(f"NegPiP Enable ({key}: {_count})")
+
+        return {
+            "crossattn": torch.stack(crossattn, dim=0),
+            "c_negpip_mask": torch.stack(negpip_mask, dim=0),
+        }
+
+    model.get_learned_conditioning = get_learned_conditioning
+
+
+def _build_negpip_mask(
+    text_processing_engine: "AnimaTextProcessingEngine",
+    line: str,
+    token_length: torch.Size,
+    device: torch.device,
+    dtype: torch.dtype,
+):
+    chunks = text_processing_engine.tokenize_line(line)
+
+    multipliers = []
+    for chunk in chunks:
+        multipliers.extend(getattr(chunk, "t5_multipliers", []))
+
+    if len(multipliers) == 0:
+        return torch.ones(token_length, device=device, dtype=dtype)
+
+    weights = torch.tensor(multipliers, device=device, dtype=dtype)
+    ones = torch.ones_like(weights)
+    mask = torch.where(weights < 0, -ones, ones)
+
+    if mask.shape[0] < token_length:
+        mask = F.pad(mask, (0, token_length - mask.shape[0]), value=1.0)
+    elif mask.shape[0] > token_length:
+        mask = mask[:token_length]
+
+    return mask
+
+
+def _hook_dit_forward(dit: "Anima"):
+
+    dit.orig_forward = dit.forward
+
+    @torch.inference_mode()
+    @wraps(dit.orig_forward)
+    def forward(
+        x: torch.Tensor,
+        timesteps: torch.Tensor,
+        context: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        transformer_options = kwargs.get("transformer_options", {})
+
+        negpip_mask = kwargs.get("c_negpip_mask", None)
+        if negpip_mask is None:
+            negpip_mask = torch.ones(
+                context.shape[0],
+                context.shape[1],
+                1,
+                device=context.device,
+                dtype=context.dtype,
+            )
+
+        transformer_options["negpip_mask"] = negpip_mask
+        kwargs["transformer_options"] = transformer_options
+
+        return dit.orig_forward(x, timesteps, context, padding_mask, **kwargs)
+
+    dit.forward = forward
+
+
+def _hook_forwards(root_module: torch.nn.Module, *, remove=False):
+    for name, module in root_module.named_modules():
+        if "cross_attn" in name and module.__class__.__name__ == "SelfCrossAttention":
+            _hook_forward(module, remove)
+
+
+def _hook_forward(module: torch.nn.Module, remove: bool):
+    if remove:
+        del module.forward
+        module.forward = module.orig_forward
+        del module.orig_forward
+        return
+
+    module.orig_forward = module.forward
+
+    @torch.inference_mode()
+    @wraps(module.orig_forward)
+    def forward(
+        x: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+        rope_emb: Optional[torch.Tensor] = None,
+        transformer_options: Optional[dict] = {},
+    ):
+        negpip_mask = transformer_options.get("negpip_mask", None)
+
+        q = module.q_proj(x)
+        context_k = x if context is None else context
+        context_v = context_k
+        if negpip_mask is not None:
+            while negpip_mask.ndim < context_v.ndim:
+                negpip_mask = negpip_mask.unsqueeze(1)
+            context_v = context_v * negpip_mask.to(context_v)
+
+        k = module.k_proj(context_k)
+        v = module.v_proj(context_v)
+
+        q, k, v = map(
+            lambda t: rearrange(
+                t, "b ... (h d) -> b ... h d", h=module.n_heads, d=module.head_dim
+            ),
+            (q, k, v),
+        )
+
+        q = module.q_norm(q)
+        k = module.k_norm(k)
+        v = module.v_norm(v)
+
+        if module.is_SelfAttn and rope_emb is not None:
+            q = module.apply_rotary_pos_emb(q, rope_emb)
+            k = module.apply_rotary_pos_emb(k, rope_emb)
+
+        return module.compute_attention(
+            q, k, v, transformer_options=transformer_options
+        )
+
+    module.forward = forward
+
+
+def _hook_compile_conditions():
+    condition.orig_forward = condition.compile_conditions
+
+    @wraps(condition.orig_forward)
+    def compile_conditions(cond):
+        if cond is None:
+            return None
+
+        if isinstance(cond, dict) and "crossattn" in cond and "vector" not in cond:
+            cross_attn = cond["crossattn"]
+            model_conds = {"c_crossattn": condition.ConditionCrossAttn(cross_attn)}
+            if "c_negpip_mask" in cond:
+                model_conds["c_negpip_mask"] = condition.Condition(
+                    cond["c_negpip_mask"]
+                )
+            return [dict(cross_attn=cross_attn, model_conds=model_conds)]
+
+        return condition.orig_forward(cond)
+
+    condition.compile_conditions = compile_conditions
+    sampling_function.compile_conditions = compile_conditions

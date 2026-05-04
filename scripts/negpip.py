@@ -1,6 +1,7 @@
 import re
 
 from lib_negpip import IS_NEO
+from lib_negpip.anima import hook_anima, unload_a
 from lib_negpip.sd import hook_forwards, unload
 from lib_negpip.utils import hr_dealer, reset_prompt_cache
 from torch import cat
@@ -16,6 +17,8 @@ neg_pattern = re.compile(r"\(\s*[^:]+\s*\:\s*-\s*\d*\.?\d+\s*\)")
 class NegPiP(scripts.Script):
     def __init__(self):
         self.reset()
+        self.is_xl: bool = False
+        self.is_anima: bool = False
 
     def reset(self):
         self.active = True
@@ -48,9 +51,12 @@ class NegPiP(scripts.Script):
 
         self.batch = p.batch_size
         self.is_xl = p.sd_model.is_sdxl
+        self.is_anima = IS_NEO and type(p.sd_model).__name__ == "Anima"
         self.rev = p.sampler_name not in ("DDIM", "PLMS", "UniPC")
 
-        if IS_NEO:
+        if self.is_anima:
+            tokenizer = p.sd_model.text_processing_engine_anima.tokenize_line
+        elif IS_NEO:
             tokenizer = (
                 p.sd_model.text_processing_engine_l.tokenize_line
                 if self.is_xl
@@ -62,6 +68,10 @@ class NegPiP(scripts.Script):
                 if self.is_xl
                 else p.sd_model.cond_stage_model.tokenize_line
             )
+
+        if self.is_anima:
+            self.handle_a = hook_anima(p)
+            return
 
         def getScheduledNegs(scheduled, prompts):
             output = []
@@ -209,8 +219,9 @@ class NegPiP(scripts.Script):
 
         p.extra_generation_params["NegPiP"] = True
 
-    def postprocess(self, p, processed, *args):
+    def postprocess(self, p, *args):
         unload(self, p)
+        unload_a(self, p)
         self.conds_all = None
         self.unconds_all = None
 
