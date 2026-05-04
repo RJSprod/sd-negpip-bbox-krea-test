@@ -51,7 +51,14 @@ class NegPiP(scripts.Script):
 
         self.batch = p.batch_size
         self.is_xl = p.sd_model.is_sdxl
-        self.is_anima = IS_NEO and type(p.sd_model).__name__ == "Anima"
+
+        if IS_NEO and not p.sd_model.is_webui_legacy_model():
+            self.is_anima = type(p.sd_model).__name__ == "Anima"
+            if not self.is_anima:
+                return
+        else:
+            self.is_anima = False
+
         self.rev = p.sampler_name not in ("DDIM", "PLMS", "UniPC")
 
         if self.is_anima:
