@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 """
 
 try:
-    from backend import shared
+    from backend import shared  # noqa
 except ImportError:
     IS_NEO = False
 else:

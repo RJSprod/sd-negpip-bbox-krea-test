@@ -1,12 +1,8 @@
 import re
 
 from lib_negpip import IS_NEO
-from lib_negpip.sd import (
-    hook_forwards,
-    hr_dealer,
-    resetpcache,
-    unload,
-)
+from lib_negpip.sd import hook_forwards, unload
+from lib_negpip.utils import hr_dealer, reset_prompt_cache
 from torch import cat
 
 from modules import scripts
@@ -14,7 +10,7 @@ from modules.prompt_parser import SdConditioning, get_learned_conditioning
 from modules.prompt_parser import get_learned_conditioning_prompt_schedules as get_ps
 from modules.script_callbacks import CFGDenoiserParams, on_cfg_denoiser
 
-neg_pattern = r"\([^\(\:\)]+\:\s*\-\d+(?:\.[\d]+)?\s*\)"
+neg_pattern = re.compile(r"\(\s*[^:]+\s*\:\s*-\s*\d*\.?\d+\s*\)")
 
 
 class NegPiP(scripts.Script):
@@ -51,19 +47,19 @@ class NegPiP(scripts.Script):
         self.hrp, self.hrn = hr_dealer(p)
 
         self.batch = p.batch_size
-        self.isxl = p.sd_model.is_sdxl
+        self.is_xl = p.sd_model.is_sdxl
         self.rev = p.sampler_name not in ("DDIM", "PLMS", "UniPC")
 
         if IS_NEO:
             tokenizer = (
                 p.sd_model.text_processing_engine_l.tokenize_line
-                if self.isxl
+                if self.is_xl
                 else p.sd_model.text_processing_engine.tokenize_line
             )
         else:
             tokenizer = (
                 p.sd_model.conditioner.embedders[0].tokenize_line
-                if self.isxl
+                if self.is_xl
                 else p.sd_model.cond_stage_model.tokenize_line
             )
 
@@ -148,20 +144,20 @@ class NegPiP(scripts.Script):
                 if start is None:
                     start = (
                         cond[0][0].cond[0:1, :]
-                        if not self.isxl
+                        if not self.is_xl
                         else cond[0][0].cond["crossattn"][0:1, :]
                     )
                 if end is None:
                     end = (
                         cond[0][0].cond[-1:, :]
-                        if not self.isxl
+                        if not self.is_xl
                         else cond[0][0].cond["crossattn"][-1:, :]
                     )
 
                 token, token_len = tokenizer(target[0])
                 conds.append(
                     cond[0][0].cond[1 : token_len + 2, :]
-                    if not self.isxl
+                    if not self.is_xl
                     else cond[0][0].cond["crossattn"][1 : token_len + 2, :]
                 )
 
@@ -193,7 +189,7 @@ class NegPiP(scripts.Script):
         if self.hrn:
             self.hr_unconds_all = calc_conds(hr_pin)
 
-        resetpcache(p)
+        reset_prompt_cache(p)
 
         def calcChunks(a, b):
             return a // b if a % b == 0 else a // b + 1
