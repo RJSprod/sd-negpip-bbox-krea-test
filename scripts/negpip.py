@@ -1,7 +1,7 @@
 import re
 
 from lib_negpip import IS_NEO
-from lib_negpip.utils import (
+from lib_negpip.sd import (
     hook_forwards,
     hr_dealer,
     resetpcache,
