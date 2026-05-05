@@ -31,15 +31,18 @@ def unload_a(cls: "NegPiP"):
         sd_model: "AnimaEngine" = shared.sd_model
         dit = sd_model.forge_objects.unet.model.diffusion_model
 
-        sd_model.get_learned_conditioning = sd_model.orig_forward
-        del sd_model.orig_forward
+        if hasattr(sd_model, "orig_forward"):
+            sd_model.get_learned_conditioning = sd_model.orig_forward
+            del sd_model.orig_forward
 
-        dit.forward = dit.orig_forward
-        del dit.orig_forward
+        if hasattr(dit, "orig_forward"):
+            dit.forward = dit.orig_forward
+            del dit.orig_forward
 
-        condition.compile_conditions = condition.orig_forward
-        sampling_function.compile_conditions = condition.orig_forward
-        del condition.orig_forward
+        if hasattr(condition, "orig_forward"):
+            condition.compile_conditions = condition.orig_forward
+            sampling_function.compile_conditions = condition.orig_forward
+            del condition.orig_forward
 
         _hook_forwards(dit, remove=True)
         del cls.handle_a
@@ -167,9 +170,9 @@ def _hook_forwards(root_module: torch.nn.Module, *, remove=False):
 
 def _hook_forward(module: torch.nn.Module, remove: bool):
     if remove:
-        del module.forward
-        module.forward = module.orig_forward
-        del module.orig_forward
+        if hasattr(module, "orig_forward"):
+            module.forward = module.orig_forward
+            del module.orig_forward
         return
 
     module.orig_forward = module.forward

@@ -47,9 +47,9 @@ def unload(cls: "NegPiP"):
 
 def _hook_forward(cls: "NegPiP", module: torch.nn.Module, remove: bool):
     if remove:
-        del module.forward
-        module.forward = module.orig_forward
-        del module.orig_forward
+        if hasattr(module, "orig_forward"):
+            module.forward = module.orig_forward
+            del module.orig_forward
         return
 
     counter = Counter(cls.is_xl)
