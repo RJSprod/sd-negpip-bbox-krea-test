@@ -146,7 +146,7 @@ class NegPiP(scripts.Script):
 
         if not flag:
             self.active = False
-            unload(self, p)
+            unload(self)
             return
 
         def cond_dealer(targets):
