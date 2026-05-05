@@ -26,13 +26,18 @@ class NegPiP(scripts.Script):
         self.conds = None
         self.c_len = []
         self.c_tokens = []
+        self.conds_all = None
 
         self.unconds = None
         self.uc_len = []
         self.uc_tokens = []
+        self.unconds_all = None
 
         self.hr = False
         self.x = None
+
+        unload(self)
+        unload_a(self)
 
     def title(self):
         return "NegPiP"
@@ -77,7 +82,7 @@ class NegPiP(scripts.Script):
             )
 
         if self.is_anima:
-            self.handle_a = hook_anima(p)
+            self.handle_a = hook_anima()
             return
 
         def getScheduledNegs(scheduled, prompts):
@@ -225,12 +230,6 @@ class NegPiP(scripts.Script):
         )
 
         p.extra_generation_params["NegPiP"] = True
-
-    def postprocess(self, p, *args):
-        unload(self, p)
-        unload_a(self, p)
-        self.conds_all = None
-        self.unconds_all = None
 
     def denoiser_callback(self, params: CFGDenoiserParams):
         if not self.active:

@@ -4,11 +4,10 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from scripts.negpip import NegPiP
 
-    from modules.processing import StableDiffusionProcessing
-
 import torch
 
 from lib_negpip import IS_NEO
+from modules import shared
 
 if IS_NEO:
     from backend.attention import attention_function as optimized_attention
@@ -39,9 +38,9 @@ def hook_forwards(cls: "NegPiP", root_module: torch.nn.Module, *, remove=False):
             _hook_forward(cls, module, remove)
 
 
-def unload(cls: "NegPiP", p: "StableDiffusionProcessing"):
+def unload(cls: "NegPiP"):
     if hasattr(cls, "handle"):
-        unet = p.sd_model.forge_objects.unet.model.diffusion_model
+        unet = shared.sd_model.forge_objects.unet.model.diffusion_model
         hook_forwards(cls, unet, remove=True)
         del cls.handle
 

@@ -9,7 +9,6 @@ if TYPE_CHECKING:
     from backend.diffusion_engine.anima import Anima as AnimaEngine
     from backend.nn.anima import Anima
     from backend.text_processing.anima_engine import AnimaTextProcessingEngine
-    from modules.processing import StableDiffusionProcessing
     from modules.prompt_parser import SdConditioning
 
 import torch
@@ -17,21 +16,23 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from backend.sampling import condition, sampling_function
+from modules import shared
 
 
-def hook_anima(p: "StableDiffusionProcessing"):
-    _hook_get_learned_conditioning(p.sd_model)
-    _hook_dit_forward(p.sd_model.forge_objects.unet.model.diffusion_model)
-    _hook_forwards(p.sd_model.forge_objects.unet.model.diffusion_model)
+def hook_anima():
+    _hook_get_learned_conditioning(shared.sd_model)
+    _hook_dit_forward(shared.sd_model.forge_objects.unet.model.diffusion_model)
+    _hook_forwards(shared.sd_model.forge_objects.unet.model.diffusion_model)
     _hook_compile_conditions()
 
 
-def unload_a(cls: "NegPiP", p: "StableDiffusionProcessing"):
+def unload_a(cls: "NegPiP"):
     if hasattr(cls, "handle_a"):
-        dit = p.sd_model.forge_objects.unet.model.diffusion_model
+        sd_model: "AnimaEngine" = shared.sd_model
+        dit = sd_model.forge_objects.unet.model.diffusion_model
 
-        p.sd_model.get_learned_conditioning = p.sd_model.orig_forward
-        del p.sd_model.orig_forward
+        sd_model.get_learned_conditioning = sd_model.orig_forward
+        del sd_model.orig_forward
 
         dit.forward = dit.orig_forward
         del dit.orig_forward
