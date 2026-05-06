@@ -231,6 +231,9 @@ class NegPiP(scripts.Script):
 
         p.extra_generation_params["NegPiP"] = True
 
+    def postprocess(self, *args, **kwargs):
+        self.reset()
+
     def denoiser_callback(self, params: CFGDenoiserParams):
         if not self.active:
             return

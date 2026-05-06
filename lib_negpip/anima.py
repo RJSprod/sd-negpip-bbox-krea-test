@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
+from backend.nn.anima import SelfCrossAttention
 from backend.sampling import condition, sampling_function
 from modules import shared
 
@@ -22,7 +23,7 @@ from modules import shared
 def hook_anima():
     _hook_get_learned_conditioning(shared.sd_model)
     _hook_dit_forward(shared.sd_model.forge_objects.unet.model.diffusion_model)
-    _hook_forwards(shared.sd_model.forge_objects.unet.model.diffusion_model)
+    _hook_forwards()
     _hook_compile_conditions()
 
 
@@ -44,7 +45,7 @@ def unload_a(cls: "NegPiP"):
             sampling_function.compile_conditions = condition.orig_forward
             del condition.orig_forward
 
-        _hook_forwards(dit, remove=True)
+        _hook_forwards(remove=True)
         del cls.handle_a
 
 
@@ -162,32 +163,31 @@ def _hook_dit_forward(dit: "Anima"):
     dit.forward = forward
 
 
-def _hook_forwards(root_module: torch.nn.Module, *, remove=False):
-    for name, module in root_module.named_modules():
-        if "cross_attn" in name and module.__class__.__name__ == "SelfCrossAttention":
-            _hook_forward(module, remove)
-
-
-def _hook_forward(module: torch.nn.Module, remove: bool):
+def _hook_forwards(*, remove=False):
     if remove:
-        if hasattr(module, "orig_forward"):
-            module.forward = module.orig_forward
-            del module.orig_forward
+        if hasattr(SelfCrossAttention, "negpip_orig_forward"):
+            if getattr(SelfCrossAttention.forward, "_negpip", False):
+                SelfCrossAttention.forward = SelfCrossAttention.negpip_orig_forward
+            del SelfCrossAttention.negpip_orig_forward
         return
 
-    module.orig_forward = module.forward
+    SelfCrossAttention.negpip_orig_forward = SelfCrossAttention.forward
 
     @torch.inference_mode()
-    @wraps(module.orig_forward)
-    def forward(
+    @wraps(SelfCrossAttention.negpip_orig_forward)
+    def negpip_forward(
+        self: SelfCrossAttention,
         x: torch.Tensor,
         context: Optional[torch.Tensor] = None,
         rope_emb: Optional[torch.Tensor] = None,
         transformer_options: Optional[dict] = {},
     ):
+        if self.is_SelfAttn:
+            return self.negpip_orig_forward(x, context, rope_emb, transformer_options)
+
         negpip_mask = transformer_options.get("negpip_mask", None)
 
-        q = module.q_proj(x)
+        q = self.q_proj(x)
         context_k = x if context is None else context
         context_v = context_k
         if negpip_mask is not None:
@@ -195,29 +195,28 @@ def _hook_forward(module: torch.nn.Module, remove: bool):
                 negpip_mask = negpip_mask.unsqueeze(1)
             context_v = context_v * negpip_mask.to(context_v)
 
-        k = module.k_proj(context_k)
-        v = module.v_proj(context_v)
+        k = self.k_proj(context_k)
+        v = self.v_proj(context_v)
 
         q, k, v = map(
             lambda t: rearrange(
-                t, "b ... (h d) -> b ... h d", h=module.n_heads, d=module.head_dim
+                t, "b ... (h d) -> b ... h d", h=self.n_heads, d=self.head_dim
             ),
             (q, k, v),
         )
 
-        q = module.q_norm(q)
-        k = module.k_norm(k)
-        v = module.v_norm(v)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        v = self.v_norm(v)
 
-        if module.is_SelfAttn and rope_emb is not None:
-            q = module.apply_rotary_pos_emb(q, rope_emb)
-            k = module.apply_rotary_pos_emb(k, rope_emb)
+        if self.is_SelfAttn and rope_emb is not None:
+            q = self.apply_rotary_pos_emb(q, rope_emb)
+            k = self.apply_rotary_pos_emb(k, rope_emb)
 
-        return module.compute_attention(
-            q, k, v, transformer_options=transformer_options
-        )
+        return self.compute_attention(q, k, v, transformer_options=transformer_options)
 
-    module.forward = forward
+    negpip_forward._negpip = True
+    SelfCrossAttention.forward = negpip_forward
 
 
 def _hook_compile_conditions():
