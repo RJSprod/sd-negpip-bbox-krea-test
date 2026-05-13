@@ -5,7 +5,7 @@ if TYPE_CHECKING:
     from modules.processing import StableDiffusionProcessing
 
 import torch
-from lib_negpip import IS_NEO
+from lib_negpip import IS_NEO, INCOMPATIBLE_EXTENSIONS
 from lib_negpip.anima import patch_anima_negpip
 from lib_negpip.sd import patch_sd_negpip
 from lib_negpip.utils import NEG_PATTERN, any_negative, hr_dealer, reset_prompt_cache
@@ -17,6 +17,16 @@ from modules.prompt_parser import (
     get_learned_conditioning_prompt_schedules,
 )
 from modules.script_callbacks import CFGDenoiserParams, on_cfg_denoiser
+
+
+def _verify_ext(p: " StableDiffusionProcessing"):
+    for ext in p.scripts.scripts:
+        if ext.title() not in INCOMPATIBLE_EXTENSIONS:
+            continue
+        if p.script_args[ext.args_from] is True:
+            return False
+
+    return True
 
 
 class NegPiP(scripts.Script):
@@ -87,6 +97,11 @@ class NegPiP(scripts.Script):
         self.reset()
 
         if not any_negative(p):
+            self.active = False
+            return
+
+        if not _verify_ext(p):
+            print("NegPiP Disabled")
             self.active = False
             return
 

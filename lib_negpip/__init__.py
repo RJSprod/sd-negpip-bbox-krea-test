@@ -22,3 +22,7 @@ except ImportError:
     IS_NEO = False
 else:
     IS_NEO = True
+
+INCOMPATIBLE_EXTENSIONS: set[str] = {
+    "Forge Couple",
+}
