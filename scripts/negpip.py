@@ -109,6 +109,7 @@ class NegPiP(scripts.Script):
             self.is_anima = type(p.sd_model).__name__ == "Anima"
             if self.is_anima:
                 patch_anima_negpip(NegPiP)
+                reset_prompt_cache(p)
                 p.extra_generation_params["NegPiP"] = True
             return
 
@@ -146,8 +147,6 @@ class NegPiP(scripts.Script):
             hr_pin = self._getScheduledNegPip(p.hr_negative_prompts, hr_steps)
             self.hr_unconds_all = self._calc_conds(p, hr_pin)
 
-        reset_prompt_cache(p)
-
         def calcChunks(a: int, b: int) -> int:
             return a // b if a % b == 0 else a // b + 1
 
@@ -155,6 +154,7 @@ class NegPiP(scripts.Script):
         self.uc_len = calcChunks(self.tokenizer(p.negative_prompts[0])[1], 75)
 
         patch_sd_negpip(self, NegPiP)
+        reset_prompt_cache(p)
         p.extra_generation_params["NegPiP"] = True
 
         if len(self.conds_all[0][0][1]) > 0:
