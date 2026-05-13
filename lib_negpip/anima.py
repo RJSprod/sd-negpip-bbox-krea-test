@@ -20,62 +20,50 @@ from backend.sampling import condition, sampling_function
 from modules import shared
 
 
-def hook_anima():
-    _hook_get_learned_conditioning(shared.sd_model)
-    _hook_dit_forward(shared.sd_model.forge_objects.unet.model.diffusion_model)
-    _hook_forwards()
-    _hook_compile_conditions()
+def patch_anima_negpip(cls: "NegPiP", *, unpatch=False):
+    if unpatch != cls._patched[1]:
+        return
+
+    cls._patched[1] = not cls._patched[1]
+
+    model: "AnimaEngine" = shared.sd_model
+    dit: "Anima" = model.forge_objects.unet.model.diffusion_model
+    _hook_get_learned_conditioning(model, unpatch)
+    _hook_dit_forward(dit, unpatch)
+    _hook_forwards(unpatch)
+    _hook_compile_conditions(unpatch)
 
 
-def unload_a(cls: "NegPiP"):
-    if hasattr(cls, "handle_a"):
-        sd_model: "AnimaEngine" = shared.sd_model
-        dit = sd_model.forge_objects.unet.model.diffusion_model
-
-        if hasattr(sd_model, "orig_forward"):
-            sd_model.get_learned_conditioning = sd_model.orig_forward
-            del sd_model.orig_forward
-
-        if hasattr(dit, "orig_forward"):
-            dit.forward = dit.orig_forward
-            del dit.orig_forward
-
-        if hasattr(condition, "orig_forward"):
-            condition.compile_conditions = condition.orig_forward
-            sampling_function.compile_conditions = condition.orig_forward
-            del condition.orig_forward
-
-        _hook_forwards(remove=True)
-        del cls.handle_a
+# ================================================================================ #
 
 
-def _hook_get_learned_conditioning(model: "AnimaEngine"):
-    engine: "AnimaTextProcessingEngine" = model.text_processing_engine_anima
+def _hook_get_learned_conditioning(model: "AnimaEngine", remove: bool):
+    if remove:
+        if hasattr(model, "orig_forward"):
+            model.get_learned_conditioning = model.orig_forward
+            del model.orig_forward
+        return
 
     model.orig_forward = model.get_learned_conditioning
 
+    engine: "AnimaTextProcessingEngine" = model.text_processing_engine_anima
+
     @torch.inference_mode()
     @wraps(model.orig_forward)
-    def get_learned_conditioning(prompt: "SdConditioning"):
+    def negpip_learned_conditioning(prompt: "SdConditioning"):
         conds = model.orig_forward(prompt)
-        if not isinstance(conds, list):
-            return conds
-
-        prompt_lines = list(prompt)
-        if len(prompt_lines) != len(conds):
-            return conds
+        assert isinstance(conds, list)
+        assert len(prompt) == len(conds)
 
         crossattn = []
         negpip_mask = []
         _count = 0
 
-        for line, cond in zip(prompt_lines, conds):
-            if not isinstance(cond, torch.Tensor):
-                return conds
+        for line, cond in zip(prompt, conds):
+            assert isinstance(cond, torch.Tensor)
 
-            cond_data = cond.reshape(-1, cond.shape[-1]) if cond.ndim > 2 else cond
-            if cond_data.ndim != 2:
-                return conds
+            cond_data = cond.reshape(-1, cond.shape[-1])
+            assert cond_data.ndim == 2
 
             mask = _build_negpip_mask(
                 engine,
@@ -99,7 +87,7 @@ def _hook_get_learned_conditioning(model: "AnimaEngine"):
             "c_negpip_mask": torch.stack(negpip_mask, dim=0),
         }
 
-    model.get_learned_conditioning = get_learned_conditioning
+    model.get_learned_conditioning = negpip_learned_conditioning
 
 
 def _build_negpip_mask(
@@ -130,13 +118,19 @@ def _build_negpip_mask(
     return mask
 
 
-def _hook_dit_forward(dit: "Anima"):
+def _hook_dit_forward(dit: "Anima", remove: bool):
+    if remove:
+        if hasattr(dit, "orig_forward"):
+            if getattr(dit.forward, "_negpip", False):
+                dit.forward = dit.orig_forward
+            del dit.orig_forward
+        return
 
     dit.orig_forward = dit.forward
 
     @torch.inference_mode()
     @wraps(dit.orig_forward)
-    def forward(
+    def negpip_forward(
         x: torch.Tensor,
         timesteps: torch.Tensor,
         context: torch.Tensor,
@@ -160,10 +154,11 @@ def _hook_dit_forward(dit: "Anima"):
 
         return dit.orig_forward(x, timesteps, context, padding_mask, **kwargs)
 
-    dit.forward = forward
+    negpip_forward._negpip = True
+    dit.forward = negpip_forward
 
 
-def _hook_forwards(*, remove=False):
+def _hook_forwards(remove: bool):
     if remove:
         if hasattr(SelfCrossAttention, "negpip_orig_forward"):
             if getattr(SelfCrossAttention.forward, "_negpip", False):
@@ -219,7 +214,14 @@ def _hook_forwards(*, remove=False):
     SelfCrossAttention.forward = negpip_forward
 
 
-def _hook_compile_conditions():
+def _hook_compile_conditions(remove: bool):
+    if remove:
+        if hasattr(condition, "orig_forward"):
+            condition.compile_conditions = condition.orig_forward
+            sampling_function.compile_conditions = condition.orig_forward
+            del condition.orig_forward
+        return
+
     condition.orig_forward = condition.compile_conditions
 
     @wraps(condition.orig_forward)

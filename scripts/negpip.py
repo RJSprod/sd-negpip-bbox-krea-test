@@ -1,43 +1,78 @@
 import re
+from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from modules.processing import StableDiffusionProcessing
+
+import torch
 from lib_negpip import IS_NEO
-from lib_negpip.anima import hook_anima, unload_a
-from lib_negpip.sd import hook_forwards, unload
-from lib_negpip.utils import hr_dealer, reset_prompt_cache
-from torch import cat
+from lib_negpip.anima import patch_anima_negpip
+from lib_negpip.sd import patch_sd_negpip
+from lib_negpip.utils import NEG_PATTERN, any_negative, hr_dealer, reset_prompt_cache
 
 from modules import scripts
-from modules.prompt_parser import SdConditioning, get_learned_conditioning
-from modules.prompt_parser import get_learned_conditioning_prompt_schedules as get_ps
+from modules.prompt_parser import (
+    SdConditioning,
+    get_learned_conditioning,
+    get_learned_conditioning_prompt_schedules,
+)
 from modules.script_callbacks import CFGDenoiserParams, on_cfg_denoiser
-
-neg_pattern = re.compile(r"\(\s*[^:]+\s*\:\s*-\s*\d*\.?\d+\s*\)")
 
 
 class NegPiP(scripts.Script):
+    _patched: list[bool] = [False, False]
+
     def __init__(self):
-        self.reset()
-        self.is_xl: bool = False
-        self.is_anima: bool = False
+        self.active: bool = False
+        self.is_xl: bool
+        self.is_anima: bool
+
+        self.tokenizer: torch.nn.Module
+
+        self.has_hr_p: bool
+        self.has_hr_n: bool
+        self.rev: bool
+
+        self.conds: list[torch.Tensor]
+        self.c_len: int
+        self.c_tokens: list[int]
+        self.conds_all: list[list[tuple[int, list[tuple[torch.Tensor, int]]]]]
+        self.hr_conds_all: list[list[tuple[int, list[tuple[torch.Tensor, int]]]]]
+
+        self.unconds: list[torch.Tensor]
+        self.uc_len: int
+        self.uc_tokens: list[int]
+        self.unconds_all: list[list[tuple[int, list[tuple[torch.Tensor, int]]]]]
+        self.hr_unconds_all: list[list[tuple[int, list[tuple[torch.Tensor, int]]]]]
+
+        self.batch_size: int
+        self.is_hr: bool
+        self.x_shape: torch.Size
+
+        on_cfg_denoiser(self.denoiser_callback)
 
     def reset(self):
         self.active = True
+        self.is_xl = False
+        self.is_anima = False
+
+        self.tokenizer = None
 
         self.conds = None
-        self.c_len = []
-        self.c_tokens = []
+        self.c_tokens = None
         self.conds_all = None
+        self.hr_conds_all = None
 
         self.unconds = None
-        self.uc_len = []
-        self.uc_tokens = []
+        self.uc_tokens = None
         self.unconds_all = None
+        self.hr_unconds_all = None
 
-        self.hr = False
-        self.x = None
+        self.is_hr = False
+        self.x_shape = None
 
-        unload(self)
-        unload_a(self)
+        patch_sd_negpip(None, NegPiP, unpatch=True)
+        patch_anima_negpip(NegPiP, unpatch=True)
 
     def title(self):
         return "NegPiP"
@@ -48,188 +83,69 @@ class NegPiP(scripts.Script):
     def ui(self, is_img2img):
         return None
 
-    def process_batch(self, p, *args, **kwargs):
+    def process_batch(self, p: "StableDiffusionProcessing", *args, **kwargs):
         self.reset()
-        flag = False
 
-        self.hrp, self.hrn = hr_dealer(p)
-
-        self.batch = p.batch_size
-        self.is_xl = p.sd_model.is_sdxl
+        if not any_negative(p):
+            self.active = False
+            return
 
         if IS_NEO and not p.sd_model.is_webui_legacy_model():
             self.is_anima = type(p.sd_model).__name__ == "Anima"
-            if not self.is_anima:
-                return
-        else:
-            self.is_anima = False
+            if self.is_anima:
+                patch_anima_negpip(NegPiP)
+                p.extra_generation_params["NegPiP"] = True
+            return
 
+        self.is_xl = p.sd_model.is_sdxl
+        self.batch_size = p.batch_size
+        self.has_hr_p, self.has_hr_n = hr_dealer(p)
         self.rev = p.sampler_name not in ("DDIM", "PLMS", "UniPC")
 
-        if self.is_anima:
-            tokenizer = p.sd_model.text_processing_engine_anima.tokenize_line
-        elif IS_NEO:
-            tokenizer = (
+        if IS_NEO:
+            self.tokenizer = (
                 p.sd_model.text_processing_engine_l.tokenize_line
                 if self.is_xl
                 else p.sd_model.text_processing_engine.tokenize_line
             )
         else:
-            tokenizer = (
+            self.tokenizer = (
                 p.sd_model.conditioner.embedders[0].tokenize_line
                 if self.is_xl
                 else p.sd_model.cond_stage_model.tokenize_line
             )
 
-        if self.is_anima:
-            self.handle_a = hook_anima()
-            return
+        nip = self._getScheduledNegPip(p.prompts, p.steps)
+        pin = self._getScheduledNegPip(p.negative_prompts, p.steps)
 
-        def getScheduledNegs(scheduled, prompts):
-            output = []
-            nonlocal flag
+        self.conds_all = self._calc_conds(p, nip)
+        self.unconds_all = self._calc_conds(p, pin)
 
-            for i, batch_schedule in enumerate(scheduled):
-                stepout = []
-                seps = None
+        hr_steps: int = getattr(p, "hr_second_pass_steps", 0) or p.steps
 
-                for step, prompt in batch_schedule:
-                    sep_prompts = prompt.split(seps) if seps else [prompt]
-                    padtextweight = []
-                    pad = 0
+        if self.has_hr_p:
+            hr_nip = self._getScheduledNegPip(p.hr_prompts, hr_steps)
+            self.hr_conds_all = self._calc_conds(p, hr_nip)
 
-                    for sep_prompt in sep_prompts:
-                        neg_targets = []
-                        text_weights = []
-                        neg_matches = re.findall(neg_pattern, sep_prompt)
-
-                        for minusmatch in neg_matches:
-                            neg_targets.append(minusmatch.strip("(").strip(")"))
-                            prompts[i] = prompts[i].replace(minusmatch, "")
-
-                        neg_targets = [x.split(":") for x in neg_targets]
-                        for text, weight in neg_targets:
-                            if text.strip() in ("BREAK", "AND"):
-                                continue
-                            weight = float(weight)
-                            if weight < 0.0:
-                                text_weights.append([text, weight])
-                                flag = True
-
-                        padtextweight.append([pad, text_weights])
-                        tokens, tokensnum = tokenizer(sep_prompt)
-                        pad = tokensnum // 75 + 1 + pad
-
-                    stepout.append([step, padtextweight])
-                output.append(stepout)
-            return output
-
-        scheduled_p = get_ps(p.prompts, p.steps)
-        nip = getScheduledNegs(scheduled_p, p.prompts)
-
-        scheduled_np = get_ps(p.negative_prompts, p.steps)
-        pin = getScheduledNegs(scheduled_np, p.negative_prompts)
-
-        if self.hrp:
-            scheduled_hr_p = get_ps(
-                p.hr_prompts,
-                p.hr_second_pass_steps if p.hr_second_pass_steps > 0 else p.steps,
-            )
-            hr_nip = getScheduledNegs(scheduled_hr_p, p.hr_prompts)
-
-        if self.hrn:
-            scheduled_hr_np = get_ps(
-                p.hr_negative_prompts,
-                p.hr_second_pass_steps if p.hr_second_pass_steps > 0 else p.steps,
-            )
-            hr_pin = getScheduledNegs(scheduled_hr_np, p.hr_negative_prompts)
-
-        if not flag:
-            self.active = False
-            unload(self)
-            return
-
-        def cond_dealer(targets):
-            conds = []
-            start = None
-            end = None
-
-            for target in targets:
-                input = SdConditioning(
-                    [f"({target[0]}:{-target[1]})"],
-                    width=p.width,
-                    height=p.height,
-                )
-
-                cond = get_learned_conditioning(p.sd_model, input, p.steps)
-
-                if start is None:
-                    start = (
-                        cond[0][0].cond[0:1, :]
-                        if not self.is_xl
-                        else cond[0][0].cond["crossattn"][0:1, :]
-                    )
-                if end is None:
-                    end = (
-                        cond[0][0].cond[-1:, :]
-                        if not self.is_xl
-                        else cond[0][0].cond["crossattn"][-1:, :]
-                    )
-
-                token, token_len = tokenizer(target[0])
-                conds.append(
-                    cond[0][0].cond[1 : token_len + 2, :]
-                    if not self.is_xl
-                    else cond[0][0].cond["crossattn"][1 : token_len + 2, :]
-                )
-
-            conds = cat(conds, 0)
-            conds = conds.unsqueeze(0)
-            return conds.repeat(self.batch, 1, 1), conds.shape[1]
-
-        def calc_conds(targetlist):
-            outconds = []
-            for batch in targetlist:
-                stepconds = []
-                for step, regions in batch:
-                    regionconds = []
-                    for region, targets in regions:
-                        if targets:
-                            conds, c_tokens = cond_dealer(targets)
-                            regionconds.append([region, conds, c_tokens])
-                        else:
-                            regionconds.append([region, None, None])
-                    stepconds.append([step, regionconds])
-                outconds.append(stepconds)
-            return outconds
-
-        self.conds_all = calc_conds(nip)
-        self.unconds_all = calc_conds(pin)
-
-        if self.hrp:
-            self.hr_conds_all = calc_conds(hr_nip)
-        if self.hrn:
-            self.hr_unconds_all = calc_conds(hr_pin)
+        if self.has_hr_n:
+            hr_pin = self._getScheduledNegPip(p.hr_negative_prompts, hr_steps)
+            self.hr_unconds_all = self._calc_conds(p, hr_pin)
 
         reset_prompt_cache(p)
 
-        def calcChunks(a, b):
+        def calcChunks(a: int, b: int) -> int:
             return a // b if a % b == 0 else a // b + 1
 
-        self.c_len = calcChunks(tokenizer(p.prompts[0])[1], 75)
-        self.uc_len = calcChunks(tokenizer(p.negative_prompts[0])[1], 75)
+        self.c_len = calcChunks(self.tokenizer(p.prompts[0])[1], 75)
+        self.uc_len = calcChunks(self.tokenizer(p.negative_prompts[0])[1], 75)
 
-        if not hasattr(self, "negpip_dr_callbacks"):
-            self.negpip_dr_callbacks = on_cfg_denoiser(self.denoiser_callback)
-
-        unet = p.sd_model.forge_objects.unet.model.diffusion_model
-        self.handle = hook_forwards(self, unet)
-
-        print(
-            f"NegPiP Enable (Positive: {self.conds_all[0][0][1][0][2]} ; Negative: {self.unconds_all[0][0][1][0][2]})"
-        )
-
+        patch_sd_negpip(self, NegPiP)
         p.extra_generation_params["NegPiP"] = True
+
+        if len(self.conds_all[0][0][1]) > 0:
+            print(f"NegPiP Enable (Positive: {self.conds_all[0][0][1][0][1]})")
+        if len(self.unconds_all[0][0][1]) > 0:
+            print(f"NegPiP Enable (Negative: {self.unconds_all[0][0][1][0][1]})")
 
     def postprocess(self, *args, **kwargs):
         self.reset()
@@ -238,19 +154,23 @@ class NegPiP(scripts.Script):
         if not self.active:
             return
 
-        if self.x is None:
-            self.x = params.x.shape
-        if self.x != params.x.shape:
-            self.hr = True
+        if self.x_shape is None:
+            self.x_shape = params.x.shape
+        if self.x_shape != params.x.shape:
+            self.is_hr = True
 
         conds_list = []
         tokens_list = []
 
-        conds = self.hr_conds_all if self.hr and self.hrp else self.conds_all
+        if self.is_hr and self.has_hr_p:
+            conds = self.hr_conds_all
+        else:
+            conds = self.conds_all
+
         if conds is not None:
             for step, regions in conds[0]:
                 if step >= params.sampling_step + 2:
-                    for region, conds, tokens in regions:
+                    for conds, tokens in regions:
                         conds_list.append(conds)
                         tokens_list.append(tokens)
                     break
@@ -260,13 +180,93 @@ class NegPiP(scripts.Script):
         unconds_list = []
         uc_tokens_list = []
 
-        unconds = self.hr_unconds_all if self.hr and self.hrn else self.unconds_all
+        if self.is_hr and self.has_hr_n:
+            unconds = self.hr_unconds_all
+        else:
+            unconds = self.unconds_all
+
         if unconds is not None:
             for step, regions in unconds[0]:
                 if step >= params.sampling_step + 2:
-                    for region, unconds, uc_tokens in regions:
+                    for unconds, uc_tokens in regions:
                         unconds_list.append(unconds)
                         uc_tokens_list.append(uc_tokens)
                         break
             self.unconds = unconds_list
             self.uc_tokens = uc_tokens_list
+
+    @staticmethod
+    def _getScheduledNegPip(
+        prompts: list[str], steps: list[int]
+    ) -> list[list[tuple[int, list[tuple[str, float]]]]]:
+        """extract the prompts with negative weights"""
+
+        output = []
+
+        scheduled = get_learned_conditioning_prompt_schedules(prompts, steps)
+        for i, batch_schedule in enumerate(scheduled):
+            stepout = []
+
+            for step, prompt in batch_schedule:
+                neg_matches: list[str] = re.findall(NEG_PATTERN, prompt)
+                neg_targets = []
+
+                for minusmatch in neg_matches:
+                    prompts[i] = prompts[i].replace(minusmatch, "")
+                    neg_targets.append(minusmatch.strip("(").strip(")"))
+
+                neg_targets: list[tuple[str, str]] = [x.split(":") for x in neg_targets]
+                text_weights: list[tuple[str, float]] = []
+
+                for text, weight in neg_targets:
+                    if text.strip() in ("BREAK", "AND", "ADDCOL", "ADDROW"):
+                        continue
+                    if (weight := float(weight)) < 0.0:
+                        text_weights.append((text, weight))
+
+                stepout.append((step, text_weights))
+
+            output.append(stepout)
+
+        return output
+
+    def _cond_dealer(
+        self, p: "StableDiffusionProcessing", target: tuple[str, float]
+    ) -> tuple[torch.Tensor, int]:
+        conds = []
+
+        input = SdConditioning(
+            [f"({target[0]}:{-target[1]})"],
+            width=p.width,
+            height=p.height,
+        )
+
+        cond = get_learned_conditioning(p.sd_model, input, p.steps)
+
+        _, token_len = self.tokenizer(target[0])
+
+        conds.append(
+            cond[0][0].cond[1 : token_len + 2, :]
+            if not self.is_xl
+            else cond[0][0].cond["crossattn"][1 : token_len + 2, :]
+        )
+
+        conds = torch.cat(conds, 0).unsqueeze(0)
+        return conds.repeat(self.batch_size, 1, 1), conds.shape[1]
+
+    def _calc_conds(
+        self,
+        p: "StableDiffusionProcessing",
+        targetlist: list[list[tuple[int, list[tuple[str, float]]]]],
+    ) -> list[list[tuple[int, list[tuple[torch.Tensor, int]]]]]:
+        outconds = []
+        for batch in targetlist:
+            stepconds = []
+            for step, regions in batch:
+                regionconds = []
+                for targets in regions:
+                    conds, c_tokens = self._cond_dealer(p, targets)
+                    regionconds.append((conds, c_tokens))
+                stepconds.append((step, regionconds))
+            outconds.append(stepconds)
+        return outconds

@@ -4,6 +4,9 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from scripts.negpip import NegPiP
 
+    from backend.nn.unet import CrossAttention
+    from backend.nn.unet import IntegratedUNet2DConditionModel as UNet
+
 import torch
 
 from lib_negpip import IS_NEO
@@ -15,13 +18,28 @@ else:
     from ldm_patched.ldm.modules.attention import optimized_attention
 
 
+def patch_sd_negpip(instance: "NegPiP", cls: "NegPiP", *, unpatch=False):
+    if unpatch != cls._patched[0]:
+        return
+
+    cls._patched[0] = not cls._patched[0]
+
+    unet: "UNet" = shared.sd_model.forge_objects.unet.model.diffusion_model
+    for name, module in unet.named_modules():
+        if "attn2" in name and module.__class__.__name__ == "CrossAttention":
+            _hook_forward(instance, module, unpatch)
+
+
+# ================================================================================ #
+
+
 class Counter:
     def __init__(self, xl: bool):
-        self.count = 0
-        self.limit = 70 if xl else 16
-        self.p = True
+        self.count: int = 0
+        self.limit: int = 70 if xl else 16
+        self.p: bool = True
 
-    def counter(self):
+    def counter(self) -> bool:
         outpn = self.p
 
         self.count += 1
@@ -32,20 +50,7 @@ class Counter:
         return outpn
 
 
-def hook_forwards(cls: "NegPiP", root_module: torch.nn.Module, *, remove=False):
-    for name, module in root_module.named_modules():
-        if "attn2" in name and module.__class__.__name__ == "CrossAttention":
-            _hook_forward(cls, module, remove)
-
-
-def unload(cls: "NegPiP"):
-    if hasattr(cls, "handle"):
-        unet = shared.sd_model.forge_objects.unet.model.diffusion_model
-        hook_forwards(cls, unet, remove=True)
-        del cls.handle
-
-
-def _hook_forward(cls: "NegPiP", module: torch.nn.Module, remove: bool):
+def _hook_forward(cls: "NegPiP", module: "CrossAttention", remove: bool):
     if remove:
         if hasattr(module, "orig_forward"):
             module.forward = module.orig_forward
@@ -58,26 +63,11 @@ def _hook_forward(cls: "NegPiP", module: torch.nn.Module, remove: bool):
 
     @torch.inference_mode()
     @wraps(module.orig_forward)
-    def forward(
-        x,
-        context=None,
-        value=None,
-        mask=None,
-        *args,
-        **kwargs,
-    ):
+    def forward(x, context=None, value=None, mask=None, *args, **kwargs):
 
         @torch.inference_mode()
-        def sub_forward(
-            x,
-            context,
-            mask,
-            conds,
-            c_tokens,
-            unconds,
-            uc_tokens,
-        ):
-            if x.shape[0] == cls.batch * 2:
+        def sub_forward(x, context, mask, conds, c_tokens, unconds, uc_tokens):
+            if x.shape[0] == cls.batch_size * 2:
                 if cls.rev:
                     contn, contp = context.chunk(2)
                     ixn, ixp = x.chunk(2)
@@ -94,24 +84,8 @@ def _hook_forward(cls: "NegPiP", module: torch.nn.Module, remove: bool):
                         unconds = unconds.expand(contn.shape[0], -1, -1)
                     contn = torch.cat((contn, unconds), 1)
 
-                xp = _main_forward(
-                    cls,
-                    module,
-                    ixp,
-                    contp,
-                    value,
-                    mask,
-                    c_tokens,
-                )
-                xn = _main_forward(
-                    cls,
-                    module,
-                    ixn,
-                    contn,
-                    value,
-                    mask,
-                    uc_tokens,
-                )
+                xp = _main_forward(cls, module, ixp, contp, value, mask, c_tokens)
+                xn = _main_forward(cls, module, ixn, contn, value, mask, uc_tokens)
 
                 out = torch.cat([xn, xp]) if cls.rev else torch.cat([xp, xn])
                 return out
@@ -132,63 +106,32 @@ def _hook_forward(cls: "NegPiP", module: torch.nn.Module, remove: bool):
                         context = torch.cat([context, unconds], 1)
                         tokens = uc_tokens
 
-                return _main_forward(
-                    cls,
-                    module,
-                    x,
-                    context,
-                    value,
-                    mask,
-                    tokens,
-                )
+                return _main_forward(cls, module, x, context, value, mask, tokens)
 
-        if (
-            cls.conds is not None
-            and cls.unconds is not None
-            and len(cls.conds) > 0
-            and len(cls.unconds) > 0
-        ):
-            return sub_forward(
-                x,
-                context,
-                mask,
-                cls.conds[0],
-                cls.c_tokens[0],
-                cls.unconds[0],
-                cls.uc_tokens[0],
-            )
-        else:
-            return sub_forward(
-                x,
-                context,
-                mask,
-                None,
-                None,
-                None,
-                None,
-            )
+        return sub_forward(
+            x,
+            context,
+            mask,
+            cls.conds[0] if len(cls.conds) > 0 else None,
+            cls.c_tokens[0] if len(cls.conds) > 0 else None,
+            cls.unconds[0] if len(cls.unconds) > 0 else None,
+            cls.uc_tokens[0] if len(cls.unconds) > 0 else None,
+        )
 
     module.forward = forward
 
 
 @torch.inference_mode()
-def _main_forward(
-    cls: "NegPiP",
-    attn,
-    x,
-    context,
-    value=None,
-    mask=None,
-    tokens=[],
-):
+def _main_forward(cls: "NegPiP", attn: "CrossAttention", x, ctx, value, mask, tokens):
     q = attn.to_q(x)
-    context = context.to(x.dtype)
-    k = attn.to_k(context)
+    ctx = ctx.to(x.dtype)
+    k = attn.to_k(ctx)
+
     if value is not None:
         v = attn.to_v(value)
         del value
     else:
-        v = attn.to_v(context)
+        v = attn.to_v(ctx)
 
     if cls.active:
         if tokens:
