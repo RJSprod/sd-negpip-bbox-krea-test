@@ -34,14 +34,17 @@ class NegPiP(scripts.Script):
 
     def __init__(self):
         self.active: bool = False
+
         self.is_xl: bool
         self.is_anima: bool
+        self.is_hr: bool
 
         self.tokenizer: torch.nn.Module
 
         self.has_hr_p: bool
         self.has_hr_n: bool
         self.rev: bool
+        self.batch_size: int
 
         self.conds: list[torch.Tensor]
         self.c_len: int
@@ -55,16 +58,14 @@ class NegPiP(scripts.Script):
         self.unconds_all: list[list[tuple[int, list[tuple[torch.Tensor, int]]]]]
         self.hr_unconds_all: list[list[tuple[int, list[tuple[torch.Tensor, int]]]]]
 
-        self.batch_size: int
-        self.is_hr: bool
-        self.x_shape: torch.Size
-
         on_cfg_denoiser(self.denoiser_callback)
 
     def reset(self):
-        self.active = True
+        self.active = False
+
         self.is_xl = False
         self.is_anima = False
+        self.is_hr = False
 
         self.tokenizer = None
 
@@ -77,9 +78,6 @@ class NegPiP(scripts.Script):
         self.uc_tokens = None
         self.unconds_all = None
         self.hr_unconds_all = None
-
-        self.is_hr = False
-        self.x_shape = None
 
         patch_sd_negpip(None, NegPiP, unpatch=True)
         patch_anima_negpip(NegPiP, unpatch=True)
@@ -97,12 +95,10 @@ class NegPiP(scripts.Script):
         self.reset()
 
         if not any_negative(p):
-            self.active = False
             return
 
         if not _verify_ext(p):
             print("NegPiP Disabled")
-            self.active = False
             return
 
         if IS_NEO and not p.sd_model.is_webui_legacy_model():
@@ -111,6 +107,7 @@ class NegPiP(scripts.Script):
                 patch_anima_negpip(NegPiP)
                 reset_prompt_cache(p)
                 p.extra_generation_params["NegPiP"] = True
+                self.active = True
             return
 
         self.is_xl = p.sd_model.is_sdxl
@@ -156,6 +153,7 @@ class NegPiP(scripts.Script):
         patch_sd_negpip(self, NegPiP)
         reset_prompt_cache(p)
         p.extra_generation_params["NegPiP"] = True
+        self.active = True
 
         if len(self.conds_all[0][0][1]) > 0:
             print(f"NegPiP Enable (Positive: {self.conds_all[0][0][1][0][1]})")
@@ -165,14 +163,12 @@ class NegPiP(scripts.Script):
     def postprocess(self, *args, **kwargs):
         self.reset()
 
-    def denoiser_callback(self, params: CFGDenoiserParams):
-        if not self.active or self.is_anima:
-            return
+    def before_hr(self, *args, **kwargs):
+        self.is_hr = True
 
-        if self.x_shape is None:
-            self.x_shape = params.x.shape
-        if self.x_shape != params.x.shape:
-            self.is_hr = True
+    def denoiser_callback(self, params: CFGDenoiserParams):
+        if (not self.active) or self.is_anima:
+            return
 
         conds_list = []
         tokens_list = []
