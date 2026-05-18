@@ -180,14 +180,15 @@ def _hook_forwards(remove: bool):
         if self.is_SelfAttn:
             return self.negpip_orig_forward(x, context, rope_emb, transformer_options)
 
-        negpip_mask = transformer_options.get("negpip_mask", None)
+        negpip_mask: torch.Tensor = transformer_options.get("negpip_mask", None)
 
         q = self.q_proj(x)
         context_k = x if context is None else context
         context_v = context_k
         if negpip_mask is not None:
-            while negpip_mask.ndim < context_v.ndim:
-                negpip_mask = negpip_mask.unsqueeze(1)
+            assert negpip_mask.ndim == context_v.ndim
+            if (batch := (x.size(0) // negpip_mask.size(0))) > 1:
+                negpip_mask = negpip_mask.repeat(batch, 1, 1)
             context_v = context_v * negpip_mask.to(context_v)
 
         k = self.k_proj(context_k)
