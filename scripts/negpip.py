@@ -166,7 +166,7 @@ class NegPiP(scripts.Script):
         self.reset()
 
     def denoiser_callback(self, params: CFGDenoiserParams):
-        if not self.active:
+        if not self.active or self.is_anima:
             return
 
         if self.x_shape is None:
