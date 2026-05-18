@@ -92,7 +92,7 @@ def _hook_forward(cls: "NegPiP", module: "CrossAttention", remove: bool):
 
             else:
                 tokens = []
-                concon = counter.count()
+                concon = counter.counter()
                 if context.shape[1] == cls.c_len * 77 and concon:
                     if conds is not None:
                         if context.shape[0] != conds.shape[0]:
