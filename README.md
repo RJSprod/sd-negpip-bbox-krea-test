@@ -3,11 +3,15 @@ This is an Extension for Forge [Classic](https://github.com/Haoming02/sd-webui-f
 
 > [!IMPORTANT]
 > Supports **SD1**, **SDXL**, **Anima**, and **Krea 2** on Forge Neo.
+> **Krea 2** is supported in **txt2img**, **img2img**, as well as **Edit** *(reference)* mode.
 
 ## How to Use
 
 - add `(foo:-1.0)` in the `positive prompt` to **remove** a concept
 - add `(bar:-1.0)` in the `negative prompt` to **enforce** a concept
+
+> [!NOTE]
+> **Krea 2** normally drops every prompt weight as soon as a reference image is attached. While this Extension is active, the weights of an **Edit** prompt are honored again, meaning that regular emphasis *(eg. `(foo:1.5)`)* takes effect as well.
 
 ## Examples
 
