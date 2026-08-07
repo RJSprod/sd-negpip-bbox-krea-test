@@ -8,9 +8,14 @@ single-stream block.
 
 The text engine turns emphasis off entirely as soon as a reference image is
 attached, since the vision tower expands one token into many embeddings and the
-weights no longer line up.  That is why Edit mode used to ignore negative
-weights, so the engine hooks below keep the emphasis alive for that path and
-expand the weights over the inserted embeddings instead.
+weights no longer line up.  The engine hooks below keep the emphasis alive for
+that path and expand the weights over the inserted embeddings instead.
+
+The engine also wraps every emphasis region in its own copy of the chat
+template, which is invisible at weight 1.0 but hands a weighted region some
+thirty tokens of system prompt and chat scaffolding.  Negating those instead of
+the words of the prompt is what made a negative weight read as a no-op, so the
+template is emitted only once here.
 """
 
 import sys
@@ -27,7 +32,7 @@ from backend.sampling import condition, sampling_function
 from modules import shared
 
 ENGINE_METHODS: tuple[str, ...] = ("__call__", "tokenize_line", "process_embeds")
-ENGINE_REQUIREMENTS: tuple[str, ...] = ("process_tokens", "strip_template", "tokenize")
+ENGINE_REQUIREMENTS: tuple[str, ...] = ("process_tokens", "strip_template", "tokenizer")
 
 
 class _EngineState:
@@ -150,6 +155,9 @@ def _hook_engine(engine, remove: bool):
         raise RuntimeError("NegPiP could not find Krea 2's PromptChunk")
     if not getattr(module, "KREA2_TAP_LAYERS", None):
         raise RuntimeError("NegPiP could not find Krea 2's hidden layers")
+    # the prompt is templated by hand below, so the slot has to be there
+    if "{}" not in getattr(engine, "llama_template", ""):
+        raise RuntimeError("NegPiP could not find Krea 2's prompt template")
 
     _state.engine_cls = engine_cls
     _state.module = module
@@ -172,12 +180,15 @@ def _negpip_call(self, texts: list[str], images: list[torch.Tensor] = []):
 
     self.emphasis = emphasis.get_current_option(shared.opts.emphasis)()
 
-    if any(emphasis.uses_emphasis(x) for x in texts):
+    emphasized = any(emphasis.uses_emphasis(x) for x in texts)
+    if emphasized:
         dynamic_args.last_extra_generation_params["Emphasis"] = self.emphasis.name
 
     # "None" and "Ignore" never scale the embeddings, leaving no negative
     # magnitude for NegPiP to restore
     weighted = isinstance(self.emphasis, emphasis.EmphasisOriginal)
+    if emphasized and not weighted:
+        print(f'NegPiP Disabled (Emphasis: "{self.emphasis.name}")')
 
     zs: list[torch.Tensor] = []
     masks: list[torch.Tensor] = []
@@ -207,14 +218,21 @@ def _encode_line(engine, line: str, images: list[torch.Tensor], weighted: bool):
 
         # the weights are expanded in place by `_negpip_process_embeds`, so
         # that the engine applies them to the embeddings of the image path too
+        previous = engine.emphasis
+        engine.emphasis = _chunk_emphasis(previous, multipliers)
         _state.multipliers = multipliers
         _state.aligned = None
         try:
             z = engine.process_tokens([tokens], [multipliers])
             aligned = _state.aligned
         finally:
+            engine.emphasis = previous
             _state.multipliers = None
             _state.aligned = None
+
+        # a silent no-op is the very failure this module exists to avoid
+        if weighted and aligned is None:
+            raise RuntimeError("NegPiP could not align Krea 2's emphasis weights")
 
         z = engine.strip_template(z, tokens)
         b, seq, fuse = z.shape
@@ -226,35 +244,65 @@ def _encode_line(engine, line: str, images: list[torch.Tensor], weighted: bool):
     return zs, masks
 
 
+def _chunk_emphasis(current, multipliers: list[float]):
+    """Pick the emphasis to encode a chunk with.
+
+    `EmphasisOriginal` rescales the whole chunk by `mean / weighted mean` to
+    preserve its magnitude.  That ratio only behaves while every weight is
+    positive: a negated region can drive the weighted mean towards zero, which
+    rescales, and at times sign flips, every token of the prompt at once.
+    NegPiP is the only source of negative weights, so it drops the
+    normalization rather than let it undo the emphasis it just applied.
+    """
+
+    from backend.text_processing import emphasis
+
+    if type(current) is not emphasis.EmphasisOriginal:
+        return current
+    if not any(weight < 0.0 for weight in multipliers):
+        return current
+
+    return emphasis.EmphasisOriginalNoNorm()
+
+
 def _negpip_tokenize_line(self, line: str, images: list[torch.Tensor] = []):
-    """Tokenize every emphasis region, inserting the vision block only once."""
+    """Tokenize the prompt as one templated conversation.
+
+    Upstream templates every emphasis region on its own, so `(foo:-1.0)` is
+    encoded as a second conversation whose system prompt, chat markers and
+    reference image all inherit the weight of the region.  Only a single token
+    of those thirty odd is the concept that was meant to be removed, which
+    leaves the mask below negating mostly scaffolding.  Emitting the template
+    once keeps the prompt well formed and puts the weight on the words alone.
+    """
 
     from backend.text_processing import parsing
 
-    parsed = parsing.parse_prompt_attention(line, self.emphasis.name)
-    if not parsed:
-        parsed = [["", 1.0]]
+    regions: list[list] = [
+        [text, weight]
+        for text, weight in parsing.parse_prompt_attention(line, self.emphasis.name)
+        # a chunking hint for CLIP, which parses to a weight of -1 and would
+        # otherwise be negated as if it were part of the prompt
+        if text != "BREAK"
+    ]
+    if not regions:
+        regions = [["", 1.0]]
 
-    texts = [text for text, _ in parsed]
-    weights = [weight for _, weight in parsed]
+    # upstream strips the prompt before templating it
+    regions[0][0] = regions[0][0].lstrip()
+    regions[-1][0] = regions[-1][0].rstrip()
 
-    if not images:
-        tokenized = self.tokenize(texts)
-    elif weights[0] == 1.0:
-        # upstream prepends the vision block to every region, which duplicates
-        # the reference image once per region of an emphasized prompt
-        tokenized = self.tokenize(texts[:1], len(images))
-        if len(texts) > 1:
-            tokenized = tokenized + self.tokenize(texts[1:])
-    else:
-        # the leading region is emphasized, so the image gets a neutral one
-        tokenized = self.tokenize([""], len(images)) + self.tokenize(texts)
-        weights.insert(0, 1.0)
+    prefix, _, suffix = self.llama_template.partition("{}")
+    if images:
+        prefix += self.vision_block * len(images)
+
+    texts = [prefix, *(text for text, _ in regions), suffix]
+    weights = [1.0, *(weight for _, weight in regions), 1.0]
 
     chunk = _state.module.PromptChunk()
     embed_count = 0
 
-    for tokens, weight in zip(tokenized, weights):
+    for tokens, weight in zip(self.tokenizer(texts)["input_ids"], weights):
         for token in tokens:
             if token == self.id_image:
                 token = {
