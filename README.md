@@ -13,6 +13,9 @@ This is an Extension for Forge [Classic](https://github.com/Haoming02/sd-webui-f
 > [!NOTE]
 > **Krea 2** normally drops every prompt weight as soon as a reference image is attached. While this Extension is active, the weights of an **Edit** prompt are honored again, meaning that regular emphasis *(eg. `(foo:1.5)`)* takes effect as well.
 
+> [!TIP]
+> **Krea 2** needs the **Emphasis Mode** Setting to be `Original` or `No norm`. The `None` and `Ignore` modes never apply prompt weights in the first place, leaving nothing for this Extension to act on; the console says so when that happens.
+
 ## Examples
 
 <table>
