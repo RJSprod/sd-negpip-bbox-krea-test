@@ -2,9 +2,19 @@
 
 Krea 2 encodes the prompt with Qwen3-VL, then concatenates the resulting text
 tokens with the reference and image streams inside a single transformer.
-NegPiP is applied by restoring the magnitude of negatively weighted text
-embeddings, then negating the value projection of those tokens in every
-single-stream block.
+
+Where CLIP and T5 weight the *output* of the text encoder, this engine weights
+the *input* embeddings instead, so a negative weight never scales the
+representation of a word: it hands the language model a negated embedding,
+which stands for no word at all.  Sign flipping that output cannot recover the
+concept, which is why negative weights read as doing nothing here however they
+were masked afterwards.  The word is therefore encoded at its magnitude, so
+the conditioning stays a faithful representation of it, and the sign is
+carried separately as a mask that negates the value projection of those tokens
+in every single-stream block.  Attention still routes to the concept, and the
+image stream subtracts it instead of adding it, which is what NegPiP is.  The
+SD implementation has the same shape: it encodes the negated concept with a
+positive weight for exactly this reason.
 
 The text engine turns emphasis off entirely as soon as a reference image is
 attached, since the vision tower expands one token into many embeddings and the
@@ -184,10 +194,11 @@ def _negpip_call(self, texts: list[str], images: list[torch.Tensor] = []):
     if emphasized:
         dynamic_args.last_extra_generation_params["Emphasis"] = self.emphasis.name
 
-    # "None" and "Ignore" never scale the embeddings, leaving no negative
-    # magnitude for NegPiP to restore
-    weighted = isinstance(self.emphasis, emphasis.EmphasisOriginal)
-    if emphasized and not weighted:
+    # "None" reads a weight as literal characters, so there is no region to
+    # negate.  Every other mode parses them, and the sign is all NegPiP needs:
+    # the magnitude only decides how strongly the concept is emphasized first.
+    signed = not isinstance(self.emphasis, emphasis.EmphasisNone)
+    if emphasized and not signed:
         print(f'NegPiP Disabled (Emphasis: "{self.emphasis.name}")')
 
     zs: list[torch.Tensor] = []
@@ -196,7 +207,7 @@ def _negpip_call(self, texts: list[str], images: list[torch.Tensor] = []):
 
     for line in texts:
         if line not in cache:
-            cache[line] = _encode_line(self, line, images, weighted)
+            cache[line] = _encode_line(self, line, images, signed)
 
         line_zs, line_masks = cache[line]
         zs.extend(line_zs)
@@ -206,7 +217,7 @@ def _negpip_call(self, texts: list[str], images: list[torch.Tensor] = []):
     return zs
 
 
-def _encode_line(engine, line: str, images: list[torch.Tensor], weighted: bool):
+def _encode_line(engine, line: str, images: list[torch.Tensor], signed: bool):
     layers = len(_state.module.KREA2_TAP_LAYERS)
 
     zs: list[torch.Tensor] = []
@@ -216,22 +227,20 @@ def _encode_line(engine, line: str, images: list[torch.Tensor], weighted: bool):
         tokens = chunk.tokens
         multipliers = list(chunk.multipliers)
 
-        # the weights are expanded in place by `_negpip_process_embeds`, so
-        # that the engine applies them to the embeddings of the image path too
-        previous = engine.emphasis
-        engine.emphasis = _chunk_emphasis(previous, multipliers)
+        # the weights are expanded, and stripped of their sign, in place by
+        # `_negpip_process_embeds`, so that the engine applies them to the
+        # embeddings of the image path too
         _state.multipliers = multipliers
         _state.aligned = None
         try:
             z = engine.process_tokens([tokens], [multipliers])
             aligned = _state.aligned
         finally:
-            engine.emphasis = previous
             _state.multipliers = None
             _state.aligned = None
 
         # a silent no-op is the very failure this module exists to avoid
-        if weighted and aligned is None:
+        if signed and aligned is None:
             raise RuntimeError("NegPiP could not align Krea 2's emphasis weights")
 
         z = engine.strip_template(z, tokens)
@@ -239,30 +248,9 @@ def _encode_line(engine, line: str, images: list[torch.Tensor], weighted: bool):
         z = z.reshape(b * seq, layers, fuse // layers)
 
         zs.append(z)
-        masks.append(_sign_mask(aligned if weighted else None, z))
+        masks.append(_sign_mask(aligned if signed else None, z))
 
     return zs, masks
-
-
-def _chunk_emphasis(current, multipliers: list[float]):
-    """Pick the emphasis to encode a chunk with.
-
-    `EmphasisOriginal` rescales the whole chunk by `mean / weighted mean` to
-    preserve its magnitude.  That ratio only behaves while every weight is
-    positive: a negated region can drive the weighted mean towards zero, which
-    rescales, and at times sign flips, every token of the prompt at once.
-    NegPiP is the only source of negative weights, so it drops the
-    normalization rather than let it undo the emphasis it just applied.
-    """
-
-    from backend.text_processing import emphasis
-
-    if type(current) is not emphasis.EmphasisOriginal:
-        return current
-    if not any(weight < 0.0 for weight in multipliers):
-        return current
-
-    return emphasis.EmphasisOriginalNoNorm()
 
 
 def _negpip_tokenize_line(self, line: str, images: list[torch.Tensor] = []):
@@ -333,8 +321,11 @@ def _negpip_process_embeds(self, batch_tokens):
         if aligned is not None:
             _state.aligned = aligned
             # the engine only applies the emphasis when the weights match the
-            # embeddings, which is exactly what the expansion above achieves
-            multipliers[:] = aligned
+            # embeddings, which is exactly what the expansion above achieves.
+            # It is handed the magnitudes: scaling an input embedding by a
+            # negative weight encodes as no word at all, so the sign is left
+            # to the mask and applied to the value projection instead
+            multipliers[:] = [abs(weight) for weight in aligned]
 
     return result
 
@@ -427,7 +418,10 @@ def _hook_get_learned_conditioning(model, remove: bool):
 
             mask = mask.to(cond)
             count += int((mask < 0).sum())
-            contexts.append(cond * mask)
+            # the conditioning is left alone: it is what the text fusion
+            # transformer reads, and the concept has to survive it intact for
+            # attention to route to the tokens the mask then subtracts
+            contexts.append(cond)
             negpip_masks.append(mask)
 
         if count:
