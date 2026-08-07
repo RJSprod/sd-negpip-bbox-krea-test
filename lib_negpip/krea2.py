@@ -63,14 +63,27 @@ class _EngineState:
     masks: list[torch.Tensor] = None
     """sign masks of the last engine call, one per prompt"""
 
+    dit_cls: type = None
+    """the patched transformer class"""
+
+    hooked: set = None
+    """the transformers whose value projections are hooked"""
+
+    reported: bool = False
+    """whether this generation has confirmed the mask reaching attention"""
+
     def reset(self):
         self.multipliers = None
         self.aligned = None
         self.masks = None
+        self.hooked = set()
+        self.reported = False
 
 
 _state = _EngineState()
+_state.reset()
 _originals: dict[str, Callable] = {}
+_dit_originals: dict[str, Callable] = {}
 
 
 def patch_krea2_negpip(cls: "NegPiP", *, unpatch: bool = False):
@@ -93,15 +106,16 @@ def patch_krea2_negpip(cls: "NegPiP", *, unpatch: bool = False):
         cls._patched[2] = False
         return
 
-    # Validate the model before changing any global methods.
+    # Validate the model before changing any global methods.  The value
+    # projections are hooked later, from inside the transformer's own forward,
+    # but a model without them should still fail here rather than mid sampling.
     engine = _find_text_engine(model)
-    list(_single_blocks(dit))
+    _value_projections(dit)
     cls._krea2_patched_model = model
     try:
         _hook_engine(engine, False)
         _hook_get_learned_conditioning(model, False)
         _hook_dit_forward(dit, False)
-        _hook_value_projections(dit, False)
         _hook_compile_conditions(False)
     except Exception:
         # Each remover tolerates a partially installed hook set.
@@ -365,7 +379,14 @@ def _align_multipliers(
 
 
 def _sign_mask(weights: Optional[list[float]], z: torch.Tensor) -> torch.Tensor:
-    """Build the ±1 mask of a prompt, aligned with its conditioning."""
+    """Build the value mask of a prompt, aligned with its conditioning.
+
+    Negated tokens keep their weight rather than collapsing to -1, so it is a
+    dial rather than a switch.  It needs to be: a single-stream transformer
+    attends over the reference and image streams as well, so a text token is a
+    far smaller share of the attention than it is in the cross attention of SD,
+    and `-1.0` alone is easily too little to see.  Everything else stays at 1.
+    """
 
     length = z.shape[0]
     ones = torch.ones(length, 1, 1, device=z.device, dtype=z.dtype)
@@ -375,7 +396,8 @@ def _sign_mask(weights: Optional[list[float]], z: torch.Tensor) -> torch.Tensor:
 
     # the template of the first region was stripped off the front
     values = torch.as_tensor(weights[-length:], device=z.device, dtype=z.dtype)
-    return torch.where(values.reshape(length, 1, 1) < 0, -ones, ones)
+    values = values.reshape(length, 1, 1)
+    return torch.where(values < 0.0, values, ones)
 
 
 # ================================================================================ #
@@ -398,6 +420,7 @@ def _hook_get_learned_conditioning(model, remove: bool):
     @wraps(original)
     def get_learned_conditioning(prompt):
         _state.masks = None
+        _state.reported = False
         conds = original(prompt)
         masks, _state.masks = _state.masks, None
 
@@ -473,30 +496,48 @@ def _hook_compile_conditions(remove: bool):
 
 
 def _hook_dit_forward(dit, remove: bool):
+    """Patch the transformer class rather than the instance we were handed.
+
+    `forge_objects` is rebuilt from `forge_objects_after_applying_lora` before
+    every sampling, and the patcher restores its object patches around it, so
+    an attribute set on one instance at `process_batch` time is not reliably
+    the attribute that runs.  Patching the class always runs, and the value
+    projections are then hooked on whichever instance actually arrives.
+    """
+
     if remove:
-        original = getattr(dit, "negpip_orig_forward", None)
-        if original is not None:
-            if getattr(dit.forward, "_negpip_krea2", False):
-                dit.forward = original
-            del dit.negpip_orig_forward
-        if hasattr(dit, "_negpip_mask"):
-            del dit._negpip_mask
+        cls = _state.dit_cls
+        original = _dit_originals.pop("forward", None)
+        if cls is not None and original is not None:
+            if getattr(cls.forward, "_negpip_krea2", False):
+                cls.forward = original
+        for hooked in _state.hooked:
+            _hook_value_projections(hooked, True)
+        _state.hooked.clear()
+        _state.dit_cls = None
         return
 
-    original = dit.forward
-    dit.negpip_orig_forward = original
+    cls = type(dit)
+    original = cls.forward
+    _dit_originals["forward"] = original
+    _state.dit_cls = cls
 
     @torch.inference_mode()
     @wraps(original)
-    def forward(*args, **kwargs):
-        dit._negpip_mask = _attention_mask(kwargs.get("c_negpip_mask"))
+    def forward(self, *args, **kwargs):
+        mask = _attention_mask(kwargs.pop("c_negpip_mask", None))
+        if mask is not None and self not in _state.hooked:
+            _hook_value_projections(self, False)
+            _state.hooked.add(self)
+
+        self._negpip_mask = mask
         try:
-            return original(*args, **kwargs)
+            return original(self, *args, **kwargs)
         finally:
-            dit._negpip_mask = None
+            self._negpip_mask = None
 
     forward._negpip_krea2 = True
-    dit.forward = forward
+    cls.forward = forward
 
 
 def _attention_mask(mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -525,15 +566,25 @@ def _single_blocks(dit):
     return blocks
 
 
-def _hook_value_projections(dit, remove: bool):
+def _value_projections(dit) -> list:
+    """The value projection of every single-stream block."""
+
+    projections = []
     for block in _single_blocks(dit):
         attention = getattr(block, "attn", getattr(block, "attention", None))
         projection = getattr(attention, "wv", None)
         if projection is None:
-            if remove:  # tolerate a partially installed hook set
-                continue
             raise RuntimeError("NegPiP could not find a Krea 2 value projection")
+        projections.append(projection)
 
+    if not projections:
+        raise RuntimeError("NegPiP found no Krea 2 single-stream blocks")
+
+    return projections
+
+
+def _hook_value_projections(dit, remove: bool):
+    for projection in _value_projections(dit):
         if remove:
             original = getattr(projection, "negpip_orig_forward", None)
             if original is not None:
@@ -541,6 +592,9 @@ def _hook_value_projections(dit, remove: bool):
                     projection.forward = original
                 del projection.negpip_orig_forward
             continue
+
+        if getattr(projection.forward, "_negpip_krea2", False):
+            continue  # installed by an earlier forward of the same transformer
 
         original = projection.forward
         projection.negpip_orig_forward = original
@@ -559,6 +613,15 @@ def _hook_value_projections(dit, remove: bool):
             # the prompt is always at the front of the reference and image streams
             text_length = min(values.shape[1], mask.shape[1])
             values[:, :text_length] *= mask[:, :text_length].to(values)
+
+            if not _state.reported:
+                _state.reported = True
+                negated = int((mask[:, :text_length] < 0).sum())
+                print(
+                    f"NegPiP Applied (Krea 2: {negated} of {text_length} text "
+                    f"tokens, {values.shape[1]} in the stream)"
+                )
+
             return values
 
         forward._negpip_krea2 = True

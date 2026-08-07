@@ -14,7 +14,11 @@ This is an Extension for Forge [Classic](https://github.com/Haoming02/sd-webui-f
 > **Krea 2** normally drops every prompt weight as soon as a reference image is attached. While this Extension is active, the weights of an **Edit** prompt are honored again, meaning that regular emphasis *(eg. `(foo:1.5)`)* takes effect as well.
 
 > [!TIP]
+> On **Krea 2** the weight is a dial, not a switch. A single-stream transformer also attends over the reference and image streams, so one text token carries far less of the attention than it does in **SD**, and `-1.0` can be too subtle to see. Turn it up *(eg. `(foo:-3.0)`)* until the concept goes.
+
+> [!TIP]
 > **Krea 2** does not work with the `None` **Emphasis Mode**, which reads a weight as literal characters rather than parsing it. The console says so when that happens; every other mode is fine.
+> When it is working, the console reports `NegPiP Applied` once per generation, with the number of tokens it negated.
 
 ## Examples
 
