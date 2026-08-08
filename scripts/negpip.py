@@ -1,14 +1,12 @@
+import importlib
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Optional
 
 if TYPE_CHECKING:
     from modules.processing import StableDiffusionProcessing
 
 import torch
 from lib_negpip import IS_NEO, INCOMPATIBLE_EXTENSIONS
-from lib_negpip.anima import patch_anima_negpip
-from lib_negpip.krea2 import patch_krea2_negpip
-from lib_negpip.sd import patch_sd_negpip
 from lib_negpip.utils import (
     NEG_PATTERN,
     any_negative,
@@ -24,6 +22,35 @@ from modules.prompt_parser import (
     get_learned_conditioning_prompt_schedules,
 )
 from modules.script_callbacks import CFGDenoiserParams, on_cfg_denoiser
+
+
+def _support(module: str, function: str) -> Optional[Callable]:
+    """Import the support for one model family.
+
+    Importing these at the top of the file means a single missing or
+    incompatible module raises out of the Extension, and Forge then skips it
+    entirely: SD, Anima and Krea 2 all go down together over any one of them,
+    and the only sign is a traceback at startup that scrolls away.  A family
+    that cannot be imported is disabled on its own instead, and says so at the
+    point where it was actually wanted.
+    """
+
+    try:
+        return getattr(importlib.import_module(f"lib_negpip.{module}"), function)
+    except Exception as error:
+        print(f"NegPiP: no {module} support ({type(error).__name__}: {error})")
+        return None
+
+
+patch_anima_negpip = _support("anima", "patch_anima_negpip")
+patch_krea2_negpip = _support("krea2", "patch_krea2_negpip")
+patch_sd_negpip = _support("sd", "patch_sd_negpip")
+
+SUPPORTED: dict[str, Optional[Callable]] = {
+    "SD": patch_sd_negpip,
+    "Anima": patch_anima_negpip,
+    "Krea 2": patch_krea2_negpip,
+}
 
 
 def _verify_ext(p: " StableDiffusionProcessing"):
@@ -91,9 +118,12 @@ class NegPiP(scripts.Script):
         self.unconds_all = None
         self.hr_unconds_all = None
 
-        patch_sd_negpip(None, NegPiP, unpatch=True)
-        patch_anima_negpip(NegPiP, unpatch=True)
-        patch_krea2_negpip(NegPiP, unpatch=True)
+        if patch_sd_negpip is not None:
+            patch_sd_negpip(None, NegPiP, unpatch=True)
+        if patch_anima_negpip is not None:
+            patch_anima_negpip(NegPiP, unpatch=True)
+        if patch_krea2_negpip is not None:
+            patch_krea2_negpip(NegPiP, unpatch=True)
 
     def title(self):
         return "NegPiP"
@@ -111,7 +141,11 @@ class NegPiP(scripts.Script):
             # once per session, so an Extension that is loaded but never
             # reaches a prompt can be told apart from one that is not there
             NegPiP._announced = True
-            print(f"NegPiP Loaded ({'Neo' if IS_NEO else 'Classic'})")
+            families = [name for name, fn in SUPPORTED.items() if fn is not None]
+            print(
+                f"NegPiP Loaded ({'Neo' if IS_NEO else 'Classic'}: "
+                f"{', '.join(families) if families else 'nothing'})"
+            )
 
         if not any_negative(p):
             return
@@ -127,8 +161,14 @@ class NegPiP(scripts.Script):
             self.is_krea2 = is_krea2(p.sd_model)
 
             if self.is_anima:
+                if patch_anima_negpip is None:
+                    print("NegPiP Disabled (Anima support failed to import)")
+                    return
                 patch_anima_negpip(NegPiP)
             elif self.is_krea2:
+                if patch_krea2_negpip is None:
+                    print("NegPiP Disabled (Krea 2 support failed to import)")
+                    return
                 patch_krea2_negpip(NegPiP, p.sd_model)
             else:
                 # the prompt asked for NegPiP, so say why it is not happening;
@@ -178,6 +218,10 @@ class NegPiP(scripts.Script):
 
         def calcChunks(a: int, b: int) -> int:
             return a // b if a % b == 0 else a // b + 1
+
+        if patch_sd_negpip is None:
+            print("NegPiP Disabled (SD support failed to import)")
+            return
 
         self.c_len = calcChunks(self.tokenizer(p.prompts[0])[1], 75)
         self.uc_len = calcChunks(self.tokenizer(p.negative_prompts[0])[1], 75)
