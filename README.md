@@ -25,13 +25,15 @@ The Extension reports what it did, so that nothing it decided is silent:
 
 | | |
 | --- | --- |
-| `NegPiP Loaded` | it is installed and being called, once per session |
+| `NegPiP Loaded` | it is installed and being called, listing the models it can handle |
 | `NegPiP Active` | it engaged, naming the model it recognised |
 | `NegPiP Enable` | how many tokens it is negating |
 | `NegPiP Applied` | *(Krea 2)* the negation reached the transformer |
 | `NegPiP Disabled` | it stood down, and why |
 
 Nothing at all for a prompt that does contain `(foo:-1.0)` means the weight was not recognised as one.
+
+If a model is missing from the `NegPiP Loaded` list, its support could not be imported, and the line above it says why. An incomplete checkout is the usual cause; `git reset --hard origin/classic` in the Extension folder restores it.
 
 ## Examples
 
