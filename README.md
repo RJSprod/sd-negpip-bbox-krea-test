@@ -18,7 +18,20 @@ This is an Extension for Forge [Classic](https://github.com/Haoming02/sd-webui-f
 
 > [!TIP]
 > **Krea 2** does not work with the `None` **Emphasis Mode**, which reads a weight as literal characters rather than parsing it. The console says so when that happens; every other mode is fine.
-> When it is working, the console reports `NegPiP Applied` once per generation, with the number of tokens it negated.
+
+## Console
+
+The Extension reports what it did, so that nothing it decided is silent:
+
+| | |
+| --- | --- |
+| `NegPiP Loaded` | it is installed and being called, once per session |
+| `NegPiP Active` | it engaged, naming the model it recognised |
+| `NegPiP Enable` | how many tokens it is negating |
+| `NegPiP Applied` | *(Krea 2)* the negation reached the transformer |
+| `NegPiP Disabled` | it stood down, and why |
+
+Nothing at all for a prompt that does contain `(foo:-1.0)` means the weight was not recognised as one.
 
 ## Examples
 

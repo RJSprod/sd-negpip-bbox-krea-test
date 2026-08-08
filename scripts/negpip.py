@@ -9,7 +9,13 @@ from lib_negpip import IS_NEO, INCOMPATIBLE_EXTENSIONS
 from lib_negpip.anima import patch_anima_negpip
 from lib_negpip.krea2 import patch_krea2_negpip
 from lib_negpip.sd import patch_sd_negpip
-from lib_negpip.utils import NEG_PATTERN, any_negative, hr_dealer, reset_prompt_cache
+from lib_negpip.utils import (
+    NEG_PATTERN,
+    any_negative,
+    hr_dealer,
+    is_krea2,
+    reset_prompt_cache,
+)
 
 from modules import scripts
 from modules.prompt_parser import (
@@ -32,6 +38,9 @@ def _verify_ext(p: " StableDiffusionProcessing"):
 
 class NegPiP(scripts.Script):
     _patched: list[bool] = [False, False, False]
+
+    _announced: bool = False
+    """whether this session has confirmed the Extension is being called"""
 
     def __init__(self):
         self.active: bool = False
@@ -98,6 +107,12 @@ class NegPiP(scripts.Script):
     def process_batch(self, p: "StableDiffusionProcessing", *args, **kwargs):
         self.reset()
 
+        if not NegPiP._announced:
+            # once per session, so an Extension that is loaded but never
+            # reaches a prompt can be told apart from one that is not there
+            NegPiP._announced = True
+            print(f"NegPiP Loaded ({'Neo' if IS_NEO else 'Classic'})")
+
         if not any_negative(p):
             return
 
@@ -105,19 +120,26 @@ class NegPiP(scripts.Script):
             print("NegPiP Disabled")
             return
 
+        model_name = type(p.sd_model).__name__
+
         if IS_NEO and not p.sd_model.is_webui_legacy_model():
-            self.is_anima = type(p.sd_model).__name__ == "Anima"
-            self.is_krea2 = type(p.sd_model).__name__.lower() in {"krea2", "krea_2"}
+            self.is_anima = model_name == "Anima"
+            self.is_krea2 = is_krea2(p.sd_model)
+
             if self.is_anima:
                 patch_anima_negpip(NegPiP)
-                reset_prompt_cache(p)
-                p.extra_generation_params["NegPiP"] = True
-                self.active = True
             elif self.is_krea2:
-                patch_krea2_negpip(NegPiP)
-                reset_prompt_cache(p)
-                p.extra_generation_params["NegPiP"] = True
-                self.active = True
+                patch_krea2_negpip(NegPiP, p.sd_model)
+            else:
+                # the prompt asked for NegPiP, so say why it is not happening;
+                # returning quietly reads as the Extension not being installed
+                print(f"NegPiP Disabled (unsupported model: {model_name})")
+                return
+
+            reset_prompt_cache(p)
+            p.extra_generation_params["NegPiP"] = True
+            self.active = True
+            print(f"NegPiP Active ({model_name})")
             return
 
         self.is_xl = p.sd_model.is_sdxl
