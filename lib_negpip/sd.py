@@ -9,7 +9,7 @@ if TYPE_CHECKING:
 
 import torch
 
-from lib_negpip import IS_NEO
+from . import IS_NEO
 from modules import shared
 
 if IS_NEO:
