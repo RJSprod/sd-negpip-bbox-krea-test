@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from modules.processing import StableDiffusionProcessing
 
-from lib_negpip import IS_NEO
+from . import IS_NEO
 
 NEG_PATTERN = re.compile(r"\(\s*(?:[^\\(:)]|\\[\(\)])+?\s*\:\s*-\s*\d*\.?\d+\s*\)")
 

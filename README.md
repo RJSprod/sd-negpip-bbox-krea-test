@@ -33,7 +33,10 @@ The Extension reports what it did, so that nothing it decided is silent:
 
 Nothing at all for a prompt that does contain `(foo:-1.0)` means the weight was not recognised as one.
 
-If a model is missing from the `NegPiP Loaded` list, its support could not be imported, and the line above it says why. An incomplete checkout is the usual cause; `git reset --hard origin/classic` in the Extension folder restores it.
+If a model is missing from the `NegPiP Loaded` list, its support could not be imported, and the line above it says why.
+
+> [!WARNING]
+> Do not install this Extension alongside the original **sd-webui-negpip**. Both patch the same hooks, and both ship a `lib_negpip` package into the single namespace Forge shares between Extensions. This one says so on the console when it finds another copy.
 
 ## Examples
 

@@ -1,19 +1,73 @@
 import importlib
+import importlib.util
+import os
 import re
+import sys
 from typing import TYPE_CHECKING, Callable, Optional
 
 if TYPE_CHECKING:
     from modules.processing import StableDiffusionProcessing
 
 import torch
-from lib_negpip import IS_NEO, INCOMPATIBLE_EXTENSIONS
-from lib_negpip.utils import (
-    NEG_PATTERN,
-    any_negative,
-    hr_dealer,
-    is_krea2,
-    reset_prompt_cache,
-)
+
+ROOT: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LIBRARY: str = os.path.join(ROOT, "lib_negpip")
+
+# every Extension shares one module namespace, so the package is imported under
+# a name that belongs to this folder alone
+PACKAGE: str = "lib_negpip_" + re.sub(r"\W", "_", os.path.basename(ROOT))
+
+
+def _import_library():
+    """Import this Extension's own `lib_negpip`, by path.
+
+    `lib_negpip` is a name generic enough to collide, and Forge loads every
+    Extension into one namespace: another copy of NegPiP installed alongside
+    this one imports first, `sys.modules["lib_negpip"]` becomes theirs, and
+    `lib_negpip.krea2` is then missing however plainly the file is sitting in
+    this folder.  Upstream has no `krea2` module at all, so a stock NegPiP next
+    to this one takes Krea 2 support down with it.
+
+    Loading by path under a name of our own cannot be shadowed, and leaves
+    whatever is under `lib_negpip` alone for whoever put it there.
+    """
+
+    if PACKAGE not in sys.modules:
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE,
+            os.path.join(LIBRARY, "__init__.py"),
+            submodule_search_locations=[LIBRARY],
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[PACKAGE] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            del sys.modules[PACKAGE]
+            raise
+
+    other = sys.modules.get("lib_negpip", None)
+    other_path = os.path.dirname(getattr(other, "__file__", "") or "")
+    if other_path and os.path.normcase(other_path) != os.path.normcase(LIBRARY):
+        print(
+            "NegPiP: another copy of the Extension is installed at "
+            f"{os.path.dirname(other_path)} ; only one of them can be active"
+        )
+
+    return sys.modules[PACKAGE]
+
+
+_library = _import_library()
+_utils = importlib.import_module(f"{PACKAGE}.utils")
+
+IS_NEO: bool = _library.IS_NEO
+INCOMPATIBLE_EXTENSIONS: set[str] = _library.INCOMPATIBLE_EXTENSIONS
+
+NEG_PATTERN = _utils.NEG_PATTERN
+any_negative = _utils.any_negative
+hr_dealer = _utils.hr_dealer
+is_krea2 = _utils.is_krea2
+reset_prompt_cache = _utils.reset_prompt_cache
 
 from modules import scripts
 from modules.prompt_parser import (
@@ -36,7 +90,7 @@ def _support(module: str, function: str) -> Optional[Callable]:
     """
 
     try:
-        return getattr(importlib.import_module(f"lib_negpip.{module}"), function)
+        return getattr(importlib.import_module(f"{PACKAGE}.{module}"), function)
     except Exception as error:
         print(f"NegPiP: no {module} support ({type(error).__name__}: {error})")
         return None
