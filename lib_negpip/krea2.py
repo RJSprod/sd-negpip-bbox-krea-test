@@ -86,16 +86,22 @@ _originals: dict[str, Callable] = {}
 _dit_originals: dict[str, Callable] = {}
 
 
-def patch_krea2_negpip(cls: "NegPiP", *, unpatch: bool = False):
+def patch_krea2_negpip(cls: "NegPiP", model=None, *, unpatch: bool = False):
     """Install or remove all Krea 2 hooks.
 
     Hooks are stored on the objects they modify so model changes and failed or
     interrupted generations can safely call this function more than once.
+
+    The caller passes the model it decided was Krea 2, so that the hooks cannot
+    land on a different one than the check was made against.
     """
     if unpatch != cls._patched[2]:
         return
 
-    model = getattr(cls, "_krea2_patched_model", None) if unpatch else shared.sd_model
+    if unpatch:
+        model = getattr(cls, "_krea2_patched_model", None)
+    elif model is None:
+        model = shared.sd_model
     if model is None:
         cls._patched[2] = False
         return
