@@ -337,7 +337,17 @@ class NegPiPRegional(scripts.Script):
             )
 
         regional = any_regional(p)
-        if not (any_negative(p) or regional):
+        negative = any_negative(p)
+
+        if _probe is not None:
+            _probe.enable(_probing())
+            _probe.begin("process_batch")
+            _probe.batch(getattr(p, "prompts", None),
+                         getattr(p, "negative_prompts", None),
+                         type(getattr(p, "sd_model", None)).__name__,
+                         regional, negative)
+
+        if not (negative or regional):
             return
 
         if not _verify_ext(p):
@@ -368,8 +378,6 @@ class NegPiPRegional(scripts.Script):
                     return
                 if _krea2 is not None:
                     _krea2.MODE = _mode()
-                if _probe is not None:
-                    _probe.enable(_probing())
                 patch_krea2_negpip(NegPiPRegional, p.sd_model)
             else:
                 # the prompt asked for NegPiP, so say why it is not happening;

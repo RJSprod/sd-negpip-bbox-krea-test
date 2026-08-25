@@ -134,11 +134,22 @@ def begin(where: str = ""):
 # The prompt, and what it became
 
 
-def prompt(parsed, which: str = ""):
-    """The REGION lines as they parsed. The first thing that can be wrong."""
+def prompt(parsed, line: str = "", which: str = ""):
+    """The prompt as received, and the REGION lines as they parsed.
+
+    The received text is logged whether or not anything parsed out of it, and
+    as a `repr` so that a newline is visibly a newline.  Logging only the
+    successes is how a run reporting `no REGION lines`, five times, about a
+    prompt that plainly had one, failed to say the thing that would have
+    explained it -- that by the time the text arrived here the line breaks were
+    gone and the keyword was in the middle of a sentence.
+    """
 
     if not _enabled:
         return
+
+    if line:
+        say(f"prompt{which} as received: {_clip(line)}")
 
     if not parsed.regions:
         say(f"prompt{which}: no REGION lines")
@@ -150,6 +161,36 @@ def prompt(parsed, which: str = ""):
         say(f"  region {number}  box ({x0:.3f}, {y0:.3f}, {x1:.3f}, {y1:.3f})"
             f"  text {region.text!r}")
     say(f"  scene: {parsed.scene!r}")
+
+
+def _clip(text: str, limit: int = 400) -> str:
+    """A string as a readable `repr`, short enough for a log line."""
+    said = str(text or "")
+    if len(said) > limit:
+        said = said[:limit] + f"... [{len(said)} characters]"
+    return repr(said)
+
+
+def batch(prompts, negatives, model: str, regional: bool, negative: bool):
+    """What the Extension was handed, before anything of ours touches it.
+
+    The other end of the bracket.  If the regions are here and gone by the time
+    :func:`prompt` sees them, the loss is in the host's own conditioning path;
+    if they are already missing here, it happened before this Extension was
+    called at all, and no amount of looking at attention was ever going to find
+    it.
+    """
+
+    if not _enabled:
+        return
+
+    say(f"batch: model {model}, "
+        f"{'regions seen' if regional else 'no regions seen'}, "
+        f"{'negative weights seen' if negative else 'no negative weights'}")
+    for number, text in enumerate(list(prompts or ())[:2], 1):
+        say(f"  prompt {number}: {_clip(text)}")
+    for number, text in enumerate(list(negatives or ())[:1], 1):
+        say(f"  negative {number}: {_clip(text)}")
 
 
 def tokens(boxes, weights, length: int):

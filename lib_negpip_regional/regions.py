@@ -56,17 +56,31 @@ to Dynamic Prompts.  There is no character left that is free in every install.
 """
 
 PATTERN = re.compile(
-    r"^[ \t]*" + KEYWORD + r"[ \t]+"
+    r"\bREGION[ \t]+"
     r"(-?\d*\.?\d+)[ \t,]+(-?\d*\.?\d+)[ \t,]+(-?\d*\.?\d+)[ \t,]+(-?\d*\.?\d+)"
-    r"[ \t]*:?[ \t]*(.*)$",
-    re.MULTILINE,
+    r"[ \t]*:?[ \t]*"
+    r"(.*?)"
+    r"(?=\n|\Z|\bREGION[ \t]+-?[\d.])"
 )
-"""A region line.
+"""A region, wherever in the prompt it turns out to be.
 
-Anchored to the start of a line so a prompt that happens to contain the word in
-running text is left alone.  Separators are spaces or commas, because both are
-what people type, and an optional colon after the numbers reads well without
-being required.
+It was anchored to the start of a line, which is where the syntax says to put
+it and is not where it arrives.  A prompt makes several hops between the box
+somebody typed it into and the text encoder -- styles, schedules, other
+Extensions -- and at least one of them can flatten it, so a line the user
+wrote on its own reaches here in the middle of a sentence and the anchor
+misses it.  The whole feature then does nothing, silently, and the log said
+`no REGION lines` about a prompt that plainly had one.
+
+What keeps this from matching prose is the four numbers, not the anchor.
+``REGION`` has to be a whole word and has to be followed by four of them, and
+"the REGION of Tuscany" is neither -- which is the case the tests actually
+guard.  Ending is the same question in reverse: the fragment runs to the end
+of its line, or to the next ``REGION``, whichever comes first, so two regions
+that arrive on one line are still two regions.
+
+Separators may be spaces or commas, and the colon after the numbers is
+optional, because both are what people type.
 """
 
 
@@ -169,11 +183,26 @@ def split(prompt: str) -> Prompt:
         if region.text and region.area > 0.0:
             regions.append(region)
 
-    scene = PATTERN.sub("", text)
-    # the removed lines leave their newlines behind
-    scene = re.sub(r"\n{2,}", "\n", scene).strip()
-
+    scene = _tidy(PATTERN.sub("", text))
     return Prompt(scene=scene, regions=regions)
+
+
+def _tidy(scene: str) -> str:
+    """What is left of the prompt once the regions are lifted out of it.
+
+    Cutting a region out of the middle of a sentence leaves the punctuation
+    that was holding it there -- a doubled comma, a run of spaces, a line with
+    nothing on it -- and every one of those is a token the text encoder pays
+    for and reads as something.
+    """
+
+    scene = re.sub(r"[ \t]+", " ", scene)
+    scene = re.sub(r"[ \t]*\n[ \t]*", "\n", scene)
+    scene = re.sub(r"(,\s*)+,", ",", scene)
+    scene = re.sub(r"\n{2,}", "\n", scene)
+    scene = re.sub(r"\s+([,.])", r"\1", scene)
+    scene = re.sub(r"[ \t]{2,}", " ", scene)
+    return scene.strip().strip(",").strip()
 
 
 def strip(prompt: str) -> str:

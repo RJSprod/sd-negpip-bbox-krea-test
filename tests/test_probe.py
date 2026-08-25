@@ -162,3 +162,50 @@ def test_a_measurement_that_cannot_be_made_is_not_an_error(probe, regional):
     #  tensors of the wrong shape entirely
     probe.attention(torch.zeros(1), torch.zeros(1), torch.zeros(1), plan, 42)
     assert "could not be measured" in read(probe) or read(probe)
+
+
+# ================================================================================ #
+# The gap that let a silent no-op stay silent
+
+
+def test_the_prompt_is_recorded_even_when_nothing_parsed(probe, regions):
+    """Logging only the successes is how five runs said nothing useful."""
+
+    said_line = "a beach at sunset, two people"
+    probe.prompt(regions.split(said_line), said_line)
+    said = read(probe)
+    assert "no REGION lines" in said
+    assert "a beach at sunset, two people" in said
+
+
+def test_a_newline_is_visible_in_the_record(probe, regions):
+    """Whether the line breaks survived is the whole question."""
+
+    said_line = "a beach\nREGION 0 0 0.5 1 (person:-4)"
+    probe.prompt(regions.split(said_line), said_line)
+    assert "\\n" in read(probe)
+
+
+def test_a_very_long_prompt_is_clipped(probe, regions):
+    said_line = "word, " * 400
+    probe.prompt(regions.split(said_line), said_line)
+    said = read(probe)
+    assert "characters]" in said
+    assert len(said) < 1200
+
+
+def test_the_batch_end_of_the_bracket_is_recorded(probe):
+    probe.batch(["a beach REGION 0 0 0.5 1 (person:-4)"], [""],
+                "Krea2", True, True)
+    said = read(probe)
+    assert "model Krea2" in said
+    assert "regions seen" in said
+    assert "negative weights seen" in said
+    assert "REGION 0 0 0.5 1" in said
+
+
+def test_the_batch_record_says_when_it_sees_nothing(probe):
+    probe.batch(["a beach"], [""], "Krea2", False, False)
+    said = read(probe)
+    assert "no regions seen" in said
+    assert "no negative weights" in said

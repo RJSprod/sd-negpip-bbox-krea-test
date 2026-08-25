@@ -108,3 +108,76 @@ def test_flattening_leaves_a_plain_prompt_exactly_as_it_was(regions):
     utils = importlib.import_module(regions.__name__.rsplit(".", 1)[0] + ".utils")
     said = "a landscape,  with   odd   spacing "
     assert utils.flatten(said) == said
+
+
+# ================================================================================ #
+# A prompt does not arrive in the shape it was typed
+
+
+def test_a_region_survives_its_line_break_being_lost(regions):
+    """The failure that made the whole feature a no-op, silently.
+
+    A prompt makes several hops between the box it was typed into and the text
+    encoder, and at least one of them can flatten it.  The anchor was never
+    what kept this from matching prose -- the four numbers are.
+    """
+
+    parsed = regions.split("a beach at sunset REGION 0 0 0.5 1 (person:-4)")
+    assert parsed.scene == "a beach at sunset"
+    assert parsed.regions[0].box == (0.0, 0.0, 0.5, 1.0)
+    assert parsed.regions[0].text == "(person:-4)"
+
+
+def test_a_flattened_prompt_with_two_regions_is_still_two(regions):
+    parsed = regions.split(
+        "a beach REGION 0 0 0.5 1 (person:-4) REGION 0.5 0 1 1 (dog:-2)")
+    assert parsed.scene == "a beach"
+    assert [r.text for r in parsed.regions] == ["(person:-4)", "(dog:-2)"]
+    assert parsed.regions[1].box == (0.5, 0.0, 1.0, 1.0)
+
+
+def test_a_region_after_a_comma_is_found(regions):
+    parsed = regions.split("a beach, REGION 0 0 0.5 1 (person:-4)")
+    assert parsed.scene == "a beach"
+    assert len(parsed.regions) == 1
+
+
+def test_the_word_still_needs_four_numbers_after_it(regions):
+    """What keeps the relaxed match out of prose."""
+
+    for said in ("a photograph of the REGION of Tuscany",
+                 "REGION without numbers",
+                 "the REGION 5 of the map"):
+        assert regions.split(said).regions == []
+        assert regions.split(said).scene == said
+
+
+def test_a_flattened_region_runs_to_the_end_of_its_line(regions):
+    """The one thing flattening costs, and it cannot be recovered.
+
+    With the line break intact a region ends where the line does.  Without it
+    there is nothing to say whether the words after the box were the region's
+    or the scene's, so they are the region's -- which is why the syntax puts
+    REGION lines at the end of a prompt.
+    """
+
+    parsed = regions.split("a beach, REGION 0 0 0.5 1 (person:-4), at sunset")
+    assert parsed.scene == "a beach"
+    assert parsed.regions[0].text == "(person:-4), at sunset"
+
+    #  the line break settles it
+    kept = regions.split("a beach, at sunset\nREGION 0 0 0.5 1 (person:-4)")
+    assert kept.scene == "a beach, at sunset"
+    assert kept.regions[0].text == "(person:-4)"
+
+
+def test_lifting_a_region_out_of_a_line_leaves_no_debris(regions):
+    parsed = regions.split(
+        "a beach,  REGION 0 0 0.5 1 (person:-4)\n, at sunset")
+    assert parsed.scene == "a beach, at sunset"
+
+
+def test_a_prompt_that_is_only_a_region_leaves_an_empty_scene(regions):
+    parsed = regions.split("REGION 0 0 1 1 everything")
+    assert parsed.scene == ""
+    assert parsed.regions[0].text == "everything"

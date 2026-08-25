@@ -324,7 +324,7 @@ def _negpip_tokenize_line(self, line: str, images: list[torch.Tensor] = []):
     from backend.text_processing import parsing
 
     parsed = regions.split(line)
-    probe.prompt(parsed)
+    probe.prompt(parsed, line)
 
     def emphasis_of(text: str) -> list[list]:
         found = [

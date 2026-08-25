@@ -34,7 +34,10 @@ REGION x0 y0 x1 y1  <terms>
 | `REGION 0.6 0 1 1 (a lighthouse:1.4)` | a lighthouse on the right, and nowhere else |
 | `REGION 0 0.6 1 1 wildflowers` | no weight at all: a phrase that only applies to the lower third |
 
-A prompt with no `REGION` line behaves exactly as it did before, and the word `REGION` in running text is left alone — the line has to start with it.
+A prompt with no `REGION` line behaves exactly as it did before, and the word `REGION` in running text is left alone — what separates a region from prose is the four numbers, not the line break.
+
+> [!TIP]
+> **Put `REGION` lines at the end of the prompt.** A prompt does not always reach the text encoder in the shape it was typed — styles, schedules and other Extensions all get a turn, and at least one of them can flatten the line breaks. A region is still found when that happens, but with no line break there is nothing to say where its text ends, so it runs to the end of the line and swallows anything written after it. Last in the prompt, there is nothing to swallow.
 
 ## What it actually does
 
@@ -111,7 +114,8 @@ attention on region 1:
   outside the box: 0.395% of each patch's attention (removed by the mask)
 ```
 
-- **`no REGION lines`** — the syntax did not match. The line has to start with `REGION`.
+- **`prompt as received`** — the prompt exactly as it reached the text encoder, as a `repr`, so a lost line break is visible as one. Compare it against the `batch:` lines above, which are what the Extension was handed before it touched anything: regions present there and gone here means the host's conditioning path flattened them.
+- **`no REGION lines`** — the syntax did not match. `REGION` has to be a whole word followed by four numbers.
 - **`no sign to apply inside it`** — the box parsed but the term carries no negative weight, usually the `None` emphasis mode.
 - **the drawing** — the box as it actually landed on the patch grid. A shape in the wrong place here is a coordinate problem; a shape in the right place means the geometry is fine and the answer is further down.
 - **the attention share** — the number that decides whether a region *can* work. NegPiP changes the sign of what a term contributes, and the size of that change is the share of attention the term already had. A term holding a fraction of a per cent of each patch's attention, flipped, moves that patch by a fraction of a per cent, and no weight on the embedding changes that: it is a fact about the attention, not about the emphasis.
