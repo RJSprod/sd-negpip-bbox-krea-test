@@ -2,7 +2,7 @@ from functools import wraps
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from scripts.negpip import NegPiP
+    from scripts.negpip_regional import NegPiPRegional
 
     from backend.nn.unet import CrossAttention
     from backend.nn.unet import IntegratedUNet2DConditionModel as UNet
@@ -18,7 +18,7 @@ else:
     from ldm_patched.ldm.modules.attention import optimized_attention
 
 
-def patch_sd_negpip(instance: "NegPiP", cls: "NegPiP", *, unpatch=False):
+def patch_sd_negpip(instance: "NegPiPRegional", cls: "NegPiPRegional", *, unpatch=False):
     if unpatch != cls._patched[0]:
         return
 
@@ -50,7 +50,7 @@ class Counter:
         return outpn
 
 
-def _hook_forward(cls: "NegPiP", module: "CrossAttention", remove: bool):
+def _hook_forward(cls: "NegPiPRegional", module: "CrossAttention", remove: bool):
     if remove:
         if hasattr(module, "orig_forward"):
             module.forward = module.orig_forward
@@ -122,7 +122,7 @@ def _hook_forward(cls: "NegPiP", module: "CrossAttention", remove: bool):
 
 
 @torch.inference_mode()
-def _main_forward(cls: "NegPiP", attn: "CrossAttention", x, ctx, value, mask, tokens):
+def _main_forward(cls: "NegPiPRegional", attn: "CrossAttention", x, ctx, value, mask, tokens):
     q = attn.to_q(x)
     ctx = ctx.to(x.dtype)
     k = attn.to_k(ctx)

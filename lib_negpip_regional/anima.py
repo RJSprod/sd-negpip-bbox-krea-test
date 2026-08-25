@@ -4,7 +4,7 @@ from functools import wraps
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from scripts.negpip import NegPiP
+    from scripts.negpip_regional import NegPiPRegional
 
     from backend.diffusion_engine.anima import Anima as AnimaEngine
     from backend.nn.anima import Anima
@@ -20,7 +20,7 @@ from backend.sampling import condition, sampling_function
 from modules import shared
 
 
-def patch_anima_negpip(cls: "NegPiP", *, unpatch=False):
+def patch_anima_negpip(cls: "NegPiPRegional", *, unpatch=False):
     if unpatch != cls._patched[1]:
         return
 
@@ -65,7 +65,7 @@ def _hook_get_learned_conditioning(model: "AnimaEngine", remove: bool):
             cond_data = cond.reshape(-1, cond.shape[-1])
             assert cond_data.ndim == 2
 
-            mask = _build_negpip_mask(
+            mask = _build_negpip_sign_mask(
                 engine,
                 line,
                 cond_data.shape[0],
@@ -80,17 +80,17 @@ def _hook_get_learned_conditioning(model: "AnimaEngine", remove: bool):
 
         if _count > 0:
             key = "Negative" if prompt.is_negative_prompt else "Positive"
-            print(f"NegPiP Enable ({key}: {_count})")
+            print(f"NegPiP Regional Enable ({key}: {_count})")
 
         return {
             "crossattn": torch.stack(crossattn, dim=0),
-            "c_negpip_mask": torch.stack(negpip_mask, dim=0),
+            "c_negpip_regional_mask": torch.stack(negpip_mask, dim=0),
         }
 
     model.get_learned_conditioning = negpip_learned_conditioning
 
 
-def _build_negpip_mask(
+def _build_negpip_sign_mask(
     text_processing_engine: "AnimaTextProcessingEngine",
     line: str,
     token_length: torch.Size,
@@ -139,7 +139,7 @@ def _hook_dit_forward(dit: "Anima", remove: bool):
     ):
         transformer_options = kwargs.get("transformer_options", {})
 
-        negpip_mask = kwargs.get("c_negpip_mask", None)
+        negpip_mask = kwargs.get("c_negpip_regional_mask", None)
         if negpip_mask is None:
             negpip_mask = torch.ones(
                 context.shape[0],
@@ -160,16 +160,16 @@ def _hook_dit_forward(dit: "Anima", remove: bool):
 
 def _hook_forwards(remove: bool):
     if remove:
-        if hasattr(SelfCrossAttention, "negpip_orig_forward"):
+        if hasattr(SelfCrossAttention, "negpip_regional_orig_forward"):
             if getattr(SelfCrossAttention.forward, "_negpip", False):
-                SelfCrossAttention.forward = SelfCrossAttention.negpip_orig_forward
-            del SelfCrossAttention.negpip_orig_forward
+                SelfCrossAttention.forward = SelfCrossAttention.negpip_regional_orig_forward
+            del SelfCrossAttention.negpip_regional_orig_forward
         return
 
-    SelfCrossAttention.negpip_orig_forward = SelfCrossAttention.forward
+    SelfCrossAttention.negpip_regional_orig_forward = SelfCrossAttention.forward
 
     @torch.inference_mode()
-    @wraps(SelfCrossAttention.negpip_orig_forward)
+    @wraps(SelfCrossAttention.negpip_regional_orig_forward)
     def negpip_forward(
         self: SelfCrossAttention,
         x: torch.Tensor,
@@ -178,7 +178,7 @@ def _hook_forwards(remove: bool):
         transformer_options: Optional[dict] = {},
     ):
         if self.is_SelfAttn:
-            return self.negpip_orig_forward(x, context, rope_emb, transformer_options)
+            return self.negpip_regional_orig_forward(x, context, rope_emb, transformer_options)
 
         negpip_mask: torch.Tensor = transformer_options.get("negpip_mask", None)
 
@@ -233,9 +233,9 @@ def _hook_compile_conditions(remove: bool):
         if isinstance(cond, dict) and "crossattn" in cond and "vector" not in cond:
             cross_attn = cond["crossattn"]
             model_conds = {"c_crossattn": condition.ConditionCrossAttn(cross_attn)}
-            if "c_negpip_mask" in cond:
-                model_conds["c_negpip_mask"] = condition.Condition(
-                    cond["c_negpip_mask"]
+            if "c_negpip_regional_mask" in cond:
+                model_conds["c_negpip_regional_mask"] = condition.Condition(
+                    cond["c_negpip_regional_mask"]
                 )
             return [dict(cross_attn=cross_attn, model_conds=model_conds)]
 

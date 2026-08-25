@@ -11,22 +11,30 @@ if TYPE_CHECKING:
 import torch
 
 ROOT: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LIBRARY: str = os.path.join(ROOT, "lib_negpip")
+LIBRARY: str = os.path.join(ROOT, "lib_negpip_regional")
 
 # every Extension shares one module namespace, so the package is imported under
 # a name that belongs to this folder alone
-PACKAGE: str = "lib_negpip_" + re.sub(r"\W", "_", os.path.basename(ROOT))
+PACKAGE: str = "lib_negpip_regional_" + re.sub(r"\W", "_", os.path.basename(ROOT))
+
+SIBLING: str = "lib_negpip"
+"""The package name stock NegPiP uses.
+
+This Extension is a fork, and the whole point of the rename is that the two can
+sit in `extensions/` at the same time: same hooks, same conditioning keys, same
+attribute markers, all of which are now spelled differently here.  Installing
+both is how you A/B a regional prompt against the plain one without moving
+folders around.  Enabling both is not -- see `_verify_ext`.
+"""
 
 
 def _import_library():
-    """Import this Extension's own `lib_negpip`, by path.
+    """Import this Extension's own package, by path.
 
     `lib_negpip` is a name generic enough to collide, and Forge loads every
-    Extension into one namespace: another copy of NegPiP installed alongside
-    this one imports first, `sys.modules["lib_negpip"]` becomes theirs, and
-    `lib_negpip.krea2` is then missing however plainly the file is sitting in
-    this folder.  Upstream has no `krea2` module at all, so a stock NegPiP next
-    to this one takes Krea 2 support down with it.
+    Extension into one namespace: two copies of NegPiP resolve to whichever
+    imported first, and a module the other one does not have is then missing
+    however plainly the file is sitting in this folder.
 
     Loading by path under a name of our own cannot be shadowed, and leaves
     whatever is under `lib_negpip` alone for whoever put it there.
@@ -46,14 +54,6 @@ def _import_library():
             del sys.modules[PACKAGE]
             raise
 
-    other = sys.modules.get("lib_negpip", None)
-    other_path = os.path.dirname(getattr(other, "__file__", "") or "")
-    if other_path and os.path.normcase(other_path) != os.path.normcase(LIBRARY):
-        print(
-            "NegPiP: another copy of the Extension is installed at "
-            f"{os.path.dirname(other_path)} ; only one of them can be active"
-        )
-
     return sys.modules[PACKAGE]
 
 
@@ -65,6 +65,8 @@ INCOMPATIBLE_EXTENSIONS: set[str] = _library.INCOMPATIBLE_EXTENSIONS
 
 NEG_PATTERN = _utils.NEG_PATTERN
 any_negative = _utils.any_negative
+any_regional = _utils.any_regional
+flatten_prompts = _utils.flatten_prompts
 hr_dealer = _utils.hr_dealer
 is_krea2 = _utils.is_krea2
 reset_prompt_cache = _utils.reset_prompt_cache
@@ -92,13 +94,84 @@ def _support(module: str, function: str) -> Optional[Callable]:
     try:
         return getattr(importlib.import_module(f"{PACKAGE}.{module}"), function)
     except Exception as error:
-        print(f"NegPiP: no {module} support ({type(error).__name__}: {error})")
+        print(f"NegPiP Regional: no {module} support ({type(error).__name__}: {error})")
+        return None
+
+
+def _module(name: str):
+    """Import one of this Extension's modules, or None.
+
+    Same tolerance as :func:`_support` and for the same reason -- a module that
+    will not import should disable what it provides, not the Extension.
+    """
+
+    try:
+        return importlib.import_module(f"{PACKAGE}.{name}")
+    except Exception:
         return None
 
 
 patch_anima_negpip = _support("anima", "patch_anima_negpip")
 patch_krea2_negpip = _support("krea2", "patch_krea2_negpip")
 patch_sd_negpip = _support("sd", "patch_sd_negpip")
+
+_krea2 = _module("krea2")
+_regional = _module("regional")
+
+SETTING = "negpip_regional_mode"
+"""Which implementation to use, on the WebUI's own settings page.
+
+A setting rather than a control on the tab because it changes nothing about the
+image -- the two paths compute the same attention and are asserted to agree --
+only how much memory it takes and how long it takes to get there.  It is here
+so that a build where the fast path misbehaves has a switch, and so that the
+two can be timed against each other without editing anything.
+"""
+
+
+def _mode() -> str:
+    """The chosen implementation, defaulting to picking one automatically."""
+
+    try:
+        from modules import shared as _shared
+
+        value = str(_shared.opts.data.get(SETTING, "auto") or "auto")
+    except Exception:
+        return "auto"
+
+    modes = getattr(_regional, "MODES", ("auto",))
+    return value if value in modes else "auto"
+
+
+def _settings():
+    """Register the one setting. Never fatal: it has a working default."""
+
+    try:
+        import gradio as gr
+        from modules import script_callbacks, shared
+
+        def register():
+            shared.opts.add_option(
+                SETTING,
+                shared.OptionInfo(
+                    "auto",
+                    "Regional NegPiP: how to apply the mask",
+                    gr.Radio,
+                    {"choices": list(getattr(_regional, "MODES", ("auto",)))},
+                    section=("negpip_regional", "NegPiP Regional"),
+                ).info(
+                    "auto picks the log-sum-exp merge where the attention "
+                    "kernel can give one, which costs a few percent of a step; "
+                    "dense builds the whole mask instead, which is the "
+                    "reference implementation and needs memory proportional to "
+                    "the square of the sequence"
+                ),
+            )
+
+        script_callbacks.on_ui_settings(register)
+    except Exception as error:
+        print(f"NegPiP Regional: no settings entry ({type(error).__name__}: {error})")
+
 
 SUPPORTED: dict[str, Optional[Callable]] = {
     "SD": patch_sd_negpip,
@@ -107,7 +180,12 @@ SUPPORTED: dict[str, Optional[Callable]] = {
 }
 
 
-def _verify_ext(p: " StableDiffusionProcessing"):
+_settings()
+
+
+def _verify_ext(p: "StableDiffusionProcessing") -> bool:
+    """Whether anything else on this generation rules the Extension out."""
+
     for ext in p.scripts.scripts:
         if ext.title() not in INCOMPATIBLE_EXTENSIONS:
             continue
@@ -117,7 +195,26 @@ def _verify_ext(p: " StableDiffusionProcessing"):
     return True
 
 
-class NegPiP(scripts.Script):
+def _sibling_active(model) -> bool:
+    """Whether stock NegPiP has already patched this model.
+
+    The rename lets both Extensions be installed; it does not let both be
+    enabled.  They wrap the same four methods, and with the markers spelled
+    differently neither one recognises the other's wrapper -- so the second to
+    arrive wraps the first, every sign is applied twice, and the image is not
+    wrong in a way anybody would connect to having two folders installed.
+
+    There is no UI switch to read: stock NegPiP is always visible and takes no
+    arguments, so `_verify_ext` above has nothing to look at.  What it does
+    leave behind is the attribute it saves the original method under, and that
+    is only on the model once it has actually patched -- which is the question
+    worth asking anyway.
+    """
+
+    return getattr(model, "negpip_orig_get_learned_conditioning", None) is not None
+
+
+class NegPiPRegional(scripts.Script):
     _patched: list[bool] = [False, False, False]
 
     _announced: bool = False
@@ -173,14 +270,14 @@ class NegPiP(scripts.Script):
         self.hr_unconds_all = None
 
         if patch_sd_negpip is not None:
-            patch_sd_negpip(None, NegPiP, unpatch=True)
+            patch_sd_negpip(None, NegPiPRegional, unpatch=True)
         if patch_anima_negpip is not None:
-            patch_anima_negpip(NegPiP, unpatch=True)
+            patch_anima_negpip(NegPiPRegional, unpatch=True)
         if patch_krea2_negpip is not None:
-            patch_krea2_negpip(NegPiP, unpatch=True)
+            patch_krea2_negpip(NegPiPRegional, unpatch=True)
 
     def title(self):
-        return "NegPiP"
+        return "NegPiP Regional"
 
     def show(self, is_img2img):
         return scripts.AlwaysVisible
@@ -191,21 +288,27 @@ class NegPiP(scripts.Script):
     def process_batch(self, p: "StableDiffusionProcessing", *args, **kwargs):
         self.reset()
 
-        if not NegPiP._announced:
+        if _sibling_active(getattr(p, "sd_model", None)):
+            print("NegPiP Regional Disabled (stock NegPiP has already patched "
+                  "this model; enable one of the two, not both)")
+            return
+
+        if not NegPiPRegional._announced:
             # once per session, so an Extension that is loaded but never
             # reaches a prompt can be told apart from one that is not there
-            NegPiP._announced = True
+            NegPiPRegional._announced = True
             families = [name for name, fn in SUPPORTED.items() if fn is not None]
             print(
-                f"NegPiP Loaded ({'Neo' if IS_NEO else 'Classic'}: "
+                f"NegPiP Regional Loaded ({'Neo' if IS_NEO else 'Classic'}: "
                 f"{', '.join(families) if families else 'nothing'})"
             )
 
-        if not any_negative(p):
+        regional = any_regional(p)
+        if not (any_negative(p) or regional):
             return
 
         if not _verify_ext(p):
-            print("NegPiP Disabled")
+            print("NegPiP Regional Disabled")
             return
 
         model_name = type(p.sd_model).__name__
@@ -214,27 +317,43 @@ class NegPiP(scripts.Script):
             self.is_anima = model_name == "Anima"
             self.is_krea2 = is_krea2(p.sd_model)
 
+            if regional and not self.is_krea2:
+                # every other family weights the output of a text encoder, and
+                # has no sequence with an image grid in it to point a box at
+                print(f"NegPiP Regional: regions need Krea 2, and this is "
+                      f"{model_name}; the weights still apply, everywhere")
+                flatten_prompts(p)
+
             if self.is_anima:
                 if patch_anima_negpip is None:
-                    print("NegPiP Disabled (Anima support failed to import)")
+                    print("NegPiP Regional Disabled (Anima support failed to import)")
                     return
-                patch_anima_negpip(NegPiP)
+                patch_anima_negpip(NegPiPRegional)
             elif self.is_krea2:
                 if patch_krea2_negpip is None:
-                    print("NegPiP Disabled (Krea 2 support failed to import)")
+                    print("NegPiP Regional Disabled (Krea 2 support failed to import)")
                     return
-                patch_krea2_negpip(NegPiP, p.sd_model)
+                if _krea2 is not None:
+                    _krea2.MODE = _mode()
+                patch_krea2_negpip(NegPiPRegional, p.sd_model)
             else:
                 # the prompt asked for NegPiP, so say why it is not happening;
                 # returning quietly reads as the Extension not being installed
-                print(f"NegPiP Disabled (unsupported model: {model_name})")
+                print(f"NegPiP Regional Disabled (unsupported model: {model_name})")
                 return
 
             reset_prompt_cache(p)
-            p.extra_generation_params["NegPiP"] = True
+            p.extra_generation_params["NegPiP Regional"] = True
+            if regional:
+                p.extra_generation_params["NegPiP Regional Mode"] = _mode()
             self.active = True
-            print(f"NegPiP Active ({model_name})")
+            print(f"NegPiP Regional Active ({model_name})")
             return
+
+        if regional:
+            print("NegPiP Regional: regions need Krea 2 on Forge Neo; the "
+                  "weights still apply, everywhere")
+            flatten_prompts(p)
 
         self.is_xl = p.sd_model.is_sdxl
         self.batch_size = p.batch_size
@@ -274,21 +393,21 @@ class NegPiP(scripts.Script):
             return a // b if a % b == 0 else a // b + 1
 
         if patch_sd_negpip is None:
-            print("NegPiP Disabled (SD support failed to import)")
+            print("NegPiP Regional Disabled (SD support failed to import)")
             return
 
         self.c_len = calcChunks(self.tokenizer(p.prompts[0])[1], 75)
         self.uc_len = calcChunks(self.tokenizer(p.negative_prompts[0])[1], 75)
 
-        patch_sd_negpip(self, NegPiP)
+        patch_sd_negpip(self, NegPiPRegional)
         reset_prompt_cache(p)
-        p.extra_generation_params["NegPiP"] = True
+        p.extra_generation_params["NegPiP Regional"] = True
         self.active = True
 
         if len(self.conds_all[0][0][1]) > 0:
-            print(f"NegPiP Enable (Positive: {self.conds_all[0][0][1][0][1]})")
+            print(f"NegPiP Regional Enable (Positive: {self.conds_all[0][0][1][0][1]})")
         if len(self.unconds_all[0][0][1]) > 0:
-            print(f"NegPiP Enable (Negative: {self.unconds_all[0][0][1][0][1]})")
+            print(f"NegPiP Regional Enable (Negative: {self.unconds_all[0][0][1][0][1]})")
 
     def postprocess(self, *args, **kwargs):
         self.reset()

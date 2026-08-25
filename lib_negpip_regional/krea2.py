@@ -1,4 +1,4 @@
-"""NegPiP support for Forge Neo's Krea 2 diffusion model.
+"""NegPiP Regional support for Forge Neo's Krea 2 diffusion model.
 
 Krea 2 encodes the prompt with Qwen3-VL, then concatenates the resulting text
 tokens with the reference and image streams inside a single transformer.
@@ -33,13 +33,15 @@ from functools import wraps
 from typing import TYPE_CHECKING, Callable, Optional
 
 if TYPE_CHECKING:
-    from scripts.negpip import NegPiP
+    from scripts.negpip_regional import NegPiPRegional
 
 import torch
 
 from backend.args import dynamic_args
 from backend.sampling import condition, sampling_function
 from modules import shared
+
+from . import regional, regions
 
 ENGINE_METHODS: tuple[str, ...] = ("__call__", "tokenize_line", "process_embeds")
 ENGINE_REQUIREMENTS: tuple[str, ...] = ("process_tokens", "strip_template", "tokenizer")
@@ -63,6 +65,15 @@ class _EngineState:
     masks: list[torch.Tensor] = None
     """sign masks of the last engine call, one per prompt"""
 
+    boxes: list = None
+    """the region each token of the chunk being encoded belongs to, or None"""
+
+    aligned_boxes: list = None
+    """^ the same list, expanded over the embeddings of every image"""
+
+    tables: list[torch.Tensor] = None
+    """region tables of the last engine call, one per prompt"""
+
     dit_cls: type = None
     """the patched transformer class"""
 
@@ -76,6 +87,9 @@ class _EngineState:
         self.multipliers = None
         self.aligned = None
         self.masks = None
+        self.boxes = None
+        self.aligned_boxes = None
+        self.tables = None
         self.hooked = set()
         self.reported = False
 
@@ -86,7 +100,7 @@ _originals: dict[str, Callable] = {}
 _dit_originals: dict[str, Callable] = {}
 
 
-def patch_krea2_negpip(cls: "NegPiP", model=None, *, unpatch: bool = False):
+def patch_krea2_negpip(cls: "NegPiPRegional", model=None, *, unpatch: bool = False):
     """Install or remove all Krea 2 hooks.
 
     Hooks are stored on the objects they modify so model changes and failed or
@@ -99,7 +113,7 @@ def patch_krea2_negpip(cls: "NegPiP", model=None, *, unpatch: bool = False):
         return
 
     if unpatch:
-        model = getattr(cls, "_krea2_patched_model", None)
+        model = getattr(cls, "_krea2_regional_patched_model", None)
     elif model is None:
         model = shared.sd_model
     if model is None:
@@ -108,7 +122,7 @@ def patch_krea2_negpip(cls: "NegPiP", model=None, *, unpatch: bool = False):
     dit = model.forge_objects.unet.model.diffusion_model
     if unpatch:
         _unhook(model, dit)
-        del cls._krea2_patched_model
+        del cls._krea2_regional_patched_model
         cls._patched[2] = False
         return
 
@@ -117,21 +131,24 @@ def patch_krea2_negpip(cls: "NegPiP", model=None, *, unpatch: bool = False):
     # but a model without them should still fail here rather than mid sampling.
     engine = _find_text_engine(model)
     _value_projections(dit)
-    cls._krea2_patched_model = model
+    cls._krea2_regional_patched_model = model
     try:
         _hook_engine(engine, False)
         _hook_get_learned_conditioning(model, False)
         _hook_dit_forward(dit, False)
         _hook_compile_conditions(False)
+        regional.install(False)
     except Exception:
         # Each remover tolerates a partially installed hook set.
         _unhook(model, dit)
-        del cls._krea2_patched_model
+        del cls._krea2_regional_patched_model
         raise
     cls._patched[2] = True
 
 
 def _unhook(model, dit):
+    regional.end()
+    regional.install(True)
     _hook_get_learned_conditioning(model, True)
     _hook_dit_forward(dit, True)
     _hook_value_projections(dit, True)
@@ -156,7 +173,7 @@ def _find_text_engine(model):
         if name.startswith("text_processing_engine") and engine is not None:
             return engine
 
-    raise RuntimeError("NegPiP could not find Krea 2's Qwen3-VL text engine")
+    raise RuntimeError("NegPiP Regional could not find Krea 2's Qwen3-VL text engine")
 
 
 # ================================================================================ #
@@ -180,14 +197,14 @@ def _hook_engine(engine, remove: bool):
 
     for attr in ENGINE_REQUIREMENTS:
         if not callable(getattr(engine, attr, None)):
-            raise RuntimeError(f"NegPiP could not find Krea 2's {attr}")
+            raise RuntimeError(f"NegPiP Regional could not find Krea 2's {attr}")
     if getattr(module, "PromptChunk", None) is None:
-        raise RuntimeError("NegPiP could not find Krea 2's PromptChunk")
+        raise RuntimeError("NegPiP Regional could not find Krea 2's PromptChunk")
     if not getattr(module, "KREA2_TAP_LAYERS", None):
-        raise RuntimeError("NegPiP could not find Krea 2's hidden layers")
+        raise RuntimeError("NegPiP Regional could not find Krea 2's hidden layers")
     # the prompt is templated by hand below, so the slot has to be there
     if "{}" not in getattr(engine, "llama_template", ""):
-        raise RuntimeError("NegPiP could not find Krea 2's prompt template")
+        raise RuntimeError("NegPiP Regional could not find Krea 2's prompt template")
 
     _state.engine_cls = engine_cls
     _state.module = module
@@ -219,21 +236,24 @@ def _negpip_call(self, texts: list[str], images: list[torch.Tensor] = []):
     # the magnitude only decides how strongly the concept is emphasized first.
     signed = not isinstance(self.emphasis, emphasis.EmphasisNone)
     if emphasized and not signed:
-        print(f'NegPiP Disabled (Emphasis: "{self.emphasis.name}")')
+        print(f'NegPiP Regional Disabled (Emphasis: "{self.emphasis.name}")')
 
     zs: list[torch.Tensor] = []
     masks: list[torch.Tensor] = []
-    cache: dict[str, tuple[list[torch.Tensor], list[torch.Tensor]]] = {}
+    tables: list[torch.Tensor] = []
+    cache: dict[str, tuple] = {}
 
     for line in texts:
         if line not in cache:
             cache[line] = _encode_line(self, line, images, signed)
 
-        line_zs, line_masks = cache[line]
+        line_zs, line_masks, line_tables = cache[line]
         zs.extend(line_zs)
         masks.extend(line_masks)
+        tables.extend(line_tables)
 
     _state.masks = masks
+    _state.tables = tables
     return zs
 
 
@@ -242,6 +262,7 @@ def _encode_line(engine, line: str, images: list[torch.Tensor], signed: bool):
 
     zs: list[torch.Tensor] = []
     masks: list[torch.Tensor] = []
+    tables: list[torch.Tensor] = []
 
     for chunk in engine.tokenize_line(line, images):
         tokens = chunk.tokens
@@ -252,16 +273,20 @@ def _encode_line(engine, line: str, images: list[torch.Tensor], signed: bool):
         # embeddings of the image path too
         _state.multipliers = multipliers
         _state.aligned = None
+        _state.aligned_boxes = None
         try:
             z = engine.process_tokens([tokens], [multipliers])
             aligned = _state.aligned
+            aligned_boxes = _state.aligned_boxes
         finally:
             _state.multipliers = None
             _state.aligned = None
+            _state.aligned_boxes = None
+            _state.boxes = None
 
         # a silent no-op is the very failure this module exists to avoid
         if signed and aligned is None:
-            raise RuntimeError("NegPiP could not align Krea 2's emphasis weights")
+            raise RuntimeError("NegPiP Regional could not align Krea 2's emphasis weights")
 
         z = engine.strip_template(z, tokens)
         b, seq, fuse = z.shape
@@ -269,12 +294,13 @@ def _encode_line(engine, line: str, images: list[torch.Tensor], signed: bool):
 
         zs.append(z)
         masks.append(_sign_mask(aligned if signed else None, z))
+        tables.append(_region_table(aligned_boxes, z))
 
-    return zs, masks
+    return zs, masks, tables
 
 
 def _negpip_tokenize_line(self, line: str, images: list[torch.Tensor] = []):
-    """Tokenize the prompt as one templated conversation.
+    """Tokenize the prompt as one templated conversation, regions and all.
 
     Upstream templates every emphasis region on its own, so `(foo:-1.0)` is
     encoded as a second conversation whose system prompt, chat markers and
@@ -282,35 +308,61 @@ def _negpip_tokenize_line(self, line: str, images: list[torch.Tensor] = []):
     of those thirty odd is the concept that was meant to be removed, which
     leaves the mask below negating mostly scaffolding.  Emitting the template
     once keeps the prompt well formed and puts the weight on the words alone.
+
+    The REGION lines are lifted off the front of that: the scene is tokenized
+    as it always was, each region's fragment is appended after it, and the box
+    each fragment came from is recorded against every token it produced.  They
+    are appended rather than encoded separately so that they share one pass of
+    the text fusion transformer with the scene -- a fragment encoded in
+    isolation has no idea what picture it is in -- and so that their tokens are
+    a contiguous tail, which is what lets `regional.merged_attention` split the
+    sequence in one place instead of gathering.
     """
 
     from backend.text_processing import parsing
 
-    regions: list[list] = [
-        [text, weight]
-        for text, weight in parsing.parse_prompt_attention(line, self.emphasis.name)
-        # a chunking hint for CLIP, which parses to a weight of -1 and would
-        # otherwise be negated as if it were part of the prompt
-        if text != "BREAK"
-    ]
-    if not regions:
-        regions = [["", 1.0]]
+    parsed = regions.split(line)
+
+    def emphasis_of(text: str) -> list[list]:
+        found = [
+            [fragment, weight]
+            for fragment, weight in parsing.parse_prompt_attention(
+                text, self.emphasis.name)
+            # a chunking hint for CLIP, which parses to a weight of -1 and would
+            # otherwise be negated as if it were part of the prompt
+            if fragment != "BREAK"
+        ]
+        return found or [["", 1.0]]
+
+    scene = emphasis_of(parsed.scene)
 
     # upstream strips the prompt before templating it
-    regions[0][0] = regions[0][0].lstrip()
-    regions[-1][0] = regions[-1][0].rstrip()
+    scene[0][0] = scene[0][0].lstrip()
+    scene[-1][0] = scene[-1][0].rstrip()
 
     prefix, _, suffix = self.llama_template.partition("{}")
     if images:
         prefix += self.vision_block * len(images)
 
-    texts = [prefix, *(text for text, _ in regions), suffix]
-    weights = [1.0, *(weight for _, weight in regions), 1.0]
+    texts = [prefix, *(text for text, _ in scene)]
+    weights = [1.0, *(weight for _, weight in scene)]
+    boxes = [None] * len(texts)
+
+    for region in parsed.regions:
+        fragments = emphasis_of(", " + region.text)
+        texts += [text for text, _ in fragments]
+        weights += [weight for _, weight in fragments]
+        boxes += [region.box] * len(fragments)
+
+    texts.append(suffix)
+    weights.append(1.0)
+    boxes.append(None)
 
     chunk = _state.module.PromptChunk()
+    chunk_boxes: list = []
     embed_count = 0
 
-    for tokens, weight in zip(self.tokenizer(texts)["input_ids"], weights):
+    for tokens, weight, box in zip(self.tokenizer(texts)["input_ids"], weights, boxes):
         for token in tokens:
             if token == self.id_image:
                 token = {
@@ -322,7 +374,11 @@ def _negpip_tokenize_line(self, line: str, images: list[torch.Tensor] = []):
 
             chunk.tokens.append(token)
             chunk.multipliers.append(weight)
+            chunk_boxes.append(box)
 
+    # `PromptChunk` is upstream's, so the regions ride alongside rather than in
+    # it: another Extension holding one of these has no idea what this is
+    _state.boxes = chunk_boxes
     return [chunk]
 
 
@@ -335,9 +391,8 @@ def _negpip_process_embeds(self, batch_tokens):
             raise RuntimeError("Unexpected Krea 2 embeddings")
 
         embeds, _, _, embeds_info = result
-        aligned = _align_multipliers(
-            batch_tokens[0], multipliers, embeds_info, embeds.shape[1]
-        )
+        inserts = _inserts(embeds_info)
+        aligned = _align(batch_tokens[0], multipliers, inserts, embeds.shape[1], 1.0)
         if aligned is not None:
             _state.aligned = aligned
             # the engine only applies the emphasis when the weights match the
@@ -347,41 +402,52 @@ def _negpip_process_embeds(self, batch_tokens):
             # to the mask and applied to the value projection instead
             multipliers[:] = [abs(weight) for weight in aligned]
 
+            # the same expansion, over the same inserts, so that a region's
+            # tokens stay lined up with its weights however many embeddings a
+            # reference image turned into
+            if _state.boxes is not None:
+                _state.aligned_boxes = _align(
+                    batch_tokens[0], _state.boxes, inserts, embeds.shape[1], None)
+
     return result
 
 
-def _align_multipliers(
-    tokens: list,
-    multipliers: list[float],
-    embeds_info: Optional[list[dict]],
-    length: int,
-) -> Optional[list[float]]:
-    """Expand the weights over the embeddings that every image turns into."""
+def _inserts(embeds_info) -> list[dict]:
+    """Where the engine put an image's embeddings, and how many there were."""
 
-    if len(tokens) != len(multipliers):
-        return None
-
-    weights = [
-        w for token, w in zip(tokens, multipliers) if not isinstance(token, dict)
-    ]
-    images = [w for token, w in zip(tokens, multipliers) if isinstance(token, dict)]
-
-    inserts = [
+    return [
         info
         for info in (embeds_info or ())
         if isinstance(info, dict) and "index" in info and "size" in info
     ]
 
+
+def _align(tokens: list, values: list, inserts: list[dict], length: int, filler):
+    """Expand a per-token list over the embeddings that every image turns into.
+
+    One function for the weights and for the regions, because the two have to
+    come out of it identically indexed: a region table that is expanded
+    differently from the weights it accompanies puts a box on the wrong tokens,
+    and the picture then has the right region in the wrong place -- which reads
+    as the coordinates being wrong rather than as an alignment bug.
+    """
+
+    if len(tokens) != len(values):
+        return None
+
+    kept = [v for token, v in zip(tokens, values) if not isinstance(token, dict)]
+    images = [v for token, v in zip(tokens, values) if isinstance(token, dict)]
+
     if len(inserts) != len(images):
         # an embed was dropped, so which image was skipped is unknown; the
-        # vision block is never emphasized anyway
-        images = [1.0] * len(inserts)
+        # vision block is never emphasized, nor inside a region, anyway
+        images = [filler] * len(inserts)
 
-    for weight, info in zip(images, inserts):
+    for value, info in zip(images, inserts):
         index = int(info["index"])
-        weights[index:index] = [weight] * int(info["size"])
+        kept[index:index] = [value] * int(info["size"])
 
-    return weights if len(weights) == length else None
+    return kept if len(kept) == length else None
 
 
 def _sign_mask(weights: Optional[list[float]], z: torch.Tensor) -> torch.Tensor:
@@ -406,29 +472,61 @@ def _sign_mask(weights: Optional[list[float]], z: torch.Tensor) -> torch.Tensor:
     return torch.where(values < 0.0, values, ones)
 
 
+def _region_table(boxes, z: torch.Tensor) -> torch.Tensor:
+    """Build the region table of a prompt, aligned with its conditioning.
+
+    One row per conditioning token: a flag, and the box that token is confined
+    to.  The coordinates are repeated on every token of a region rather than
+    kept in a table beside it because this has to survive the conditioning
+    machinery, which stacks and pads tensors shaped like the prompt -- and
+    padding a short prompt up to a long one adds rows of zeros, whose flag is
+    already "no region".
+
+    The template of the first region was stripped off the front of `z`, so the
+    tail is what lines up, exactly as it does for the sign mask.
+    """
+
+    length = z.shape[0]
+    empty = torch.zeros(length, regional.COLUMNS, device=z.device, dtype=z.dtype)
+
+    if not boxes or len(boxes) < length:
+        return empty
+
+    for index, box in enumerate(boxes[-length:]):
+        if not box:
+            continue
+        empty[index, 0] = 1.0
+        empty[index, 1:] = torch.tensor(list(box), device=z.device, dtype=z.dtype)
+
+    return empty
+
+
 # ================================================================================ #
 # Conditioning
 
 
 def _hook_get_learned_conditioning(model, remove: bool):
     if remove:
-        original = getattr(model, "negpip_orig_get_learned_conditioning", None)
+        original = getattr(model, "negpip_regional_orig_get_learned_conditioning", None)
         if original is not None:
-            if getattr(model.get_learned_conditioning, "_negpip_krea2", False):
+            if getattr(model.get_learned_conditioning, "_negpip_regional_krea2", False):
                 model.get_learned_conditioning = original
-            del model.negpip_orig_get_learned_conditioning
+            del model.negpip_regional_orig_get_learned_conditioning
         return
 
     original = model.get_learned_conditioning
-    model.negpip_orig_get_learned_conditioning = original
+    model.negpip_regional_orig_get_learned_conditioning = original
 
     @torch.inference_mode()
     @wraps(original)
     def get_learned_conditioning(prompt):
         _state.masks = None
+        _state.tables = None
         _state.reported = False
+        regional.forget()
         conds = original(prompt)
         masks, _state.masks = _state.masks, None
+        tables, _state.tables = _state.tables, None
 
         # Krea 2 returns one [tokens, layers, features] tensor per prompt.
         # Keep this deliberately strict: silently losing the mask is worse than
@@ -437,62 +535,72 @@ def _hook_get_learned_conditioning(model, remove: bool):
             raise RuntimeError("Unexpected Krea 2 conditioning result")
         if masks is None or len(masks) != len(conds):
             raise RuntimeError("Unexpected Krea 2 conditioning masks")
+        if tables is None or len(tables) != len(conds):
+            raise RuntimeError("Unexpected Krea 2 conditioning regions")
 
-        contexts, negpip_masks = [], []
+        contexts, negpip_masks, region_tables = [], [], []
         count = 0
+        confined = 0
 
-        for cond, mask in zip(conds, masks):
+        for cond, mask, table in zip(conds, masks, tables):
             if not isinstance(cond, torch.Tensor):
                 raise RuntimeError("Unexpected Krea 2 conditioning item")
 
             mask = mask.to(cond)
+            table = table.to(cond)
             count += int((mask < 0).sum())
+            confined += int((table[:, 0] > 0).sum())
             # the conditioning is left alone: it is what the text fusion
             # transformer reads, and the concept has to survive it intact for
             # attention to route to the tokens the mask then subtracts
             contexts.append(cond)
             negpip_masks.append(mask)
+            region_tables.append(table)
 
-        if count:
+        if count or confined:
             key = (
                 "Negative"
                 if getattr(prompt, "is_negative_prompt", False)
                 else "Positive"
             )
-            print(f"NegPiP Enable ({key}: {count})")
+            print(f"NegPiP Regional Enable ({key}: {count} signed, "
+                  f"{confined} confined)")
 
         # lists, so that prompts of different lengths are padded downstream
-        return {"crossattn": contexts, "c_negpip_mask": negpip_masks}
+        return {
+            "crossattn": contexts,
+            "c_negpip_regional_mask": negpip_masks,
+            "c_negpip_region_table": region_tables,
+        }
 
-    get_learned_conditioning._negpip_krea2 = True
+    get_learned_conditioning._negpip_regional_krea2 = True
     model.get_learned_conditioning = get_learned_conditioning
 
 
 def _hook_compile_conditions(remove: bool):
     if remove:
-        original = getattr(condition, "negpip_krea2_orig_compile_conditions", None)
+        original = getattr(condition, "negpip_regional_krea2_orig_compile_conditions", None)
         if original is not None:
             condition.compile_conditions = original
             sampling_function.compile_conditions = original
-            del condition.negpip_krea2_orig_compile_conditions
+            del condition.negpip_regional_krea2_orig_compile_conditions
         return
 
     original = condition.compile_conditions
-    condition.negpip_krea2_orig_compile_conditions = original
+    condition.negpip_regional_krea2_orig_compile_conditions = original
 
     @wraps(original)
     def compile_conditions(cond):
         if isinstance(cond, dict) and "crossattn" in cond and "vector" not in cond:
             crossattn = cond["crossattn"]
             model_conds = {"c_crossattn": condition.ConditionCrossAttn(crossattn)}
-            if "c_negpip_mask" in cond:
-                model_conds["c_negpip_mask"] = condition.Condition(
-                    cond["c_negpip_mask"]
-                )
+            for key in ("c_negpip_regional_mask", "c_negpip_region_table"):
+                if key in cond:
+                    model_conds[key] = condition.Condition(cond[key])
             return [dict(cross_attn=crossattn, model_conds=model_conds)]
         return original(cond)
 
-    compile_conditions._negpip_krea2 = True
+    compile_conditions._negpip_regional_krea2 = True
     condition.compile_conditions = compile_conditions
     sampling_function.compile_conditions = compile_conditions
 
@@ -515,7 +623,7 @@ def _hook_dit_forward(dit, remove: bool):
         cls = _state.dit_cls
         original = _dit_originals.pop("forward", None)
         if cls is not None and original is not None:
-            if getattr(cls.forward, "_negpip_krea2", False):
+            if getattr(cls.forward, "_negpip_regional_krea2", False):
                 cls.forward = original
         for hooked in _state.hooked:
             _hook_value_projections(hooked, True)
@@ -531,19 +639,72 @@ def _hook_dit_forward(dit, remove: bool):
     @torch.inference_mode()
     @wraps(original)
     def forward(self, *args, **kwargs):
-        mask = _attention_mask(kwargs.pop("c_negpip_mask", None))
+        mask = _attention_mask(kwargs.pop("c_negpip_regional_mask", None))
+        table = kwargs.pop("c_negpip_region_table", None)
         if mask is not None and self not in _state.hooked:
             _hook_value_projections(self, False)
             _state.hooked.add(self)
 
-        self._negpip_mask = mask
+        plan = _plan(self, args, kwargs, table)
+        self._negpip_sign_mask = mask
+        regional.begin(plan)
         try:
             return original(self, *args, **kwargs)
         finally:
-            self._negpip_mask = None
+            regional.end()
+            self._negpip_sign_mask = None
 
-    forward._negpip_krea2 = True
+    forward._negpip_regional_krea2 = True
     cls.forward = forward
+
+
+def _plan(dit, args, kwargs, table) -> Optional["regional.Plan"]:
+    """Work out where the boxes land in the sequence this forward is about to build.
+
+    The one thing a region cannot be given ahead of time is its geometry.  The
+    patch grid depends on the resolution being sampled, and highres fix samples
+    two of them from the same prompt -- so a plan built when the prompt was
+    encoded would be right for the first pass and quietly wrong for the second.
+    It is built here instead, from the latent that is on its way in, which is
+    the only place both halves are known at once.
+    """
+
+    if not isinstance(table, torch.Tensor):
+        return None
+
+    latent = args[0] if args else kwargs.get("x", None)
+    context = args[2] if len(args) > 2 else kwargs.get("context", None)
+    if not isinstance(latent, torch.Tensor) or not isinstance(context, torch.Tensor):
+        return None
+
+    patch = int(getattr(dit, "patch", 0) or 0)
+    if patch <= 0:
+        return None
+
+    # `forward` squeezes a frame axis off the front and pads up to the patch
+    # size; the grid is what is left, and `_imgids` numbers it row-major
+    height, width = int(latent.shape[-2]), int(latent.shape[-1])
+    grid = regional.Geometry(
+        txtlen=int(context.shape[1]),
+        height=-(-height // patch),
+        width=-(-width // patch),
+    )
+
+    spans = regional.spans_from_table(table, grid.txtlen)
+    if not any(spans):
+        return None
+
+    return regional.Plan(geometry=grid, spans=spans, mode=MODE)
+
+
+MODE: str = "auto"
+"""Which implementation to use; see :mod:`.regional`.
+
+Settable from the Extension's settings page, and left here rather than read
+from `shared.opts` at attention time so that a build without the setting, or a
+setting removed between versions, is one default rather than an exception
+thirty times a step.
+"""
 
 
 def _attention_mask(mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -568,7 +729,7 @@ def _single_blocks(dit):
         if blocks is not None:
             break
     if blocks is None:
-        raise RuntimeError("NegPiP could not find Krea 2 single-stream blocks")
+        raise RuntimeError("NegPiP Regional could not find Krea 2 single-stream blocks")
     return blocks
 
 
@@ -580,11 +741,11 @@ def _value_projections(dit) -> list:
         attention = getattr(block, "attn", getattr(block, "attention", None))
         projection = getattr(attention, "wv", None)
         if projection is None:
-            raise RuntimeError("NegPiP could not find a Krea 2 value projection")
+            raise RuntimeError("NegPiP Regional could not find a Krea 2 value projection")
         projections.append(projection)
 
     if not projections:
-        raise RuntimeError("NegPiP found no Krea 2 single-stream blocks")
+        raise RuntimeError("NegPiP Regional found no Krea 2 single-stream blocks")
 
     return projections
 
@@ -592,24 +753,24 @@ def _value_projections(dit) -> list:
 def _hook_value_projections(dit, remove: bool):
     for projection in _value_projections(dit):
         if remove:
-            original = getattr(projection, "negpip_orig_forward", None)
+            original = getattr(projection, "negpip_regional_orig_forward", None)
             if original is not None:
-                if getattr(projection.forward, "_negpip_krea2", False):
+                if getattr(projection.forward, "_negpip_regional_krea2", False):
                     projection.forward = original
-                del projection.negpip_orig_forward
+                del projection.negpip_regional_orig_forward
             continue
 
-        if getattr(projection.forward, "_negpip_krea2", False):
+        if getattr(projection.forward, "_negpip_regional_krea2", False):
             continue  # installed by an earlier forward of the same transformer
 
         original = projection.forward
-        projection.negpip_orig_forward = original
+        projection.negpip_regional_orig_forward = original
 
         @torch.inference_mode()
         @wraps(original)
         def forward(x, *args, __original=original, **kwargs):
             values = __original(x, *args, **kwargs)
-            mask = getattr(dit, "_negpip_mask", None)
+            mask = getattr(dit, "_negpip_sign_mask", None)
             if mask is None:
                 return values
             if values.shape[0] % mask.shape[0]:
@@ -624,11 +785,11 @@ def _hook_value_projections(dit, remove: bool):
                 _state.reported = True
                 negated = int((mask[:, :text_length] < 0).sum())
                 print(
-                    f"NegPiP Applied (Krea 2: {negated} of {text_length} text "
+                    f"NegPiP Regional Applied (Krea 2: {negated} of {text_length} text "
                     f"tokens, {values.shape[1]} in the stream)"
                 )
 
             return values
 
-        forward._negpip_krea2 = True
+        forward._negpip_regional_krea2 = True
         projection.forward = forward
