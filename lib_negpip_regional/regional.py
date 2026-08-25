@@ -144,6 +144,22 @@ class Plan:
 
     mode: str = "auto"
 
+    boost: float = 0.0
+    """How much louder a region's keys are, inside its box, in log space.
+
+    Confining a term is not the same as making it matter.  A region of four
+    tokens in a stream of nearly three thousand holds about half a per cent of
+    each patch's attention, and NegPiP changes the *sign* of what a term
+    contributes -- so flipping half a per cent moves the picture by about one
+    per cent, whichever way the sign goes, which is nothing anybody can see.
+
+    Added to the region's key scores for the queries inside its box, before the
+    softmax, so it is a multiplier on the attention that reaches it: ``2.3`` is
+    ten times, ``4.6`` is a hundred.  Zero, and the box only confines, which is
+    what the first version did and what the measurement in the log then
+    explained.
+    """
+
     @property
     def active(self) -> bool:
         return any(self.spans)
@@ -308,7 +324,7 @@ def dense_mask(plan: Plan, total: int, batch: int, device, dtype) -> torch.Tenso
                 continue
             bias[index, 0, :, span.start:span.stop] = blocked
             allowed = query_rows(span, plan.geometry, total, device)
-            bias[index, 0, allowed, span.start:span.stop] = 0.0
+            bias[index, 0, allowed, span.start:span.stop] = float(plan.boost)
 
     return bias
 
@@ -473,7 +489,7 @@ def _shaped(result, q):
     return out, lse[:, :, : q.shape[2]].float()
 
 
-def _region_attention(q, k, v, allowed, scale):
+def _region_attention(q, k, v, allowed, scale, boost: float = 0.0):
     """Attention over one region's keys, and its log-sum-exp per query.
 
     Written out rather than handed to a kernel because the key block is a
@@ -484,6 +500,10 @@ def _region_attention(q, k, v, allowed, scale):
 
     scale = scale if scale is not None else 1.0 / math.sqrt(q.shape[-1])
     scores = torch.matmul(q.float(), k.float().transpose(-1, -2)) * scale
+    if boost:
+        # in log space, so this is a multiplier on the attention that lands
+        # here once the softmax has normalised everything against everything
+        scores = scores + float(boost)
     lse = torch.logsumexp(scores, dim=-1)
     out = torch.matmul(torch.softmax(scores, dim=-1), v.float())
 
@@ -626,6 +646,7 @@ def _merge_item(q, k, v, spans: list[Span], plan: Plan, total: int, scale,
             v[index : index + 1][:, :, span.start : span.stop],
             reach[inside].unsqueeze(0),
             scale,
+            plan.boost,
         ))
 
     merged = _merge(parts)[0].to(base_out.dtype)

@@ -276,3 +276,41 @@ def test_a_plan_with_no_prompts_in_it_masks_no_fusion(regional):
     plan = _plan(regional, [])
     assert plan.prompts == 0
     assert not regional._is_fusion(plan, 12, 2)
+
+
+def test_the_boost_reaches_both_paths_identically(regional):
+    """The two implementations must agree with a boost as they do without one."""
+
+    plan = _plan(regional, [[_span(regional, 8, 2, (0.0, 0.0, 1.0, 0.4))], []])
+    plan.boost = 2.5
+    total = 12 + 30
+    q, k, v = _qkv(total)
+
+    bias = regional.dense_mask(plan, total, q.shape[0], q.device, q.dtype)
+    reference = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=bias)
+
+    merged = regional.merged_attention(q, k, v, plan, total)
+    if merged is None:
+        pytest.skip("no log-sum-exp from this attention build")
+
+    assert torch.allclose(merged, reference, atol=1e-5, rtol=1e-4)
+
+
+def test_the_dense_mask_lifts_only_the_queries_inside_the_box(regional):
+    plan = _plan(regional, [[_span(regional, 8, 2, (0.0, 0.0, 1.0, 0.5))]])
+    plan.boost = 3.0
+    total = 12 + 30
+    bias = regional.dense_mask(plan, total, 1, "cpu", torch.float32)
+
+    #  a patch in the top half hears the region three nats louder
+    assert float(bias[0, 0, 12, 8]) == 3.0
+    #  one in the bottom half does not hear it at all
+    assert float(bias[0, 0, total - 1, 8]) == torch.finfo(torch.float32).min
+    #  and nothing else in the mask moved
+    assert float(bias[0, 0, :, :8].abs().max()) == 0.0
+
+
+def test_no_boost_leaves_the_mask_exactly_as_it_was(regional):
+    plan = _plan(regional, [[_span(regional, 8, 2, (0.0, 0.0, 1.0, 0.5))]])
+    bias = regional.dense_mask(plan, 12 + 30, 1, "cpu", torch.float32)
+    assert float(bias[0, 0, 12, 8]) == 0.0

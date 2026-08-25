@@ -353,10 +353,12 @@ def attention(q, k, v, plan, total: int, scale=None):
                 picked = rows[torch.linspace(
                     0, rows.numel() - 1, min(SAMPLE, rows.numel()),
                     device=rows.device).long()]
+                boost = plan.boost if "inside" in label else 0.0
                 shares.append((label, _share(
-                    q, k, v, item, picked, span, scale, _lse_attention)))
+                    q, k, v, item, picked, span, scale, _lse_attention, boost)))
 
-            say(f"attention on region {number}:")
+            say(f"attention on region {number}:"
+                + (f" boost {plan.boost:+.1f}" if plan.boost else " no boost"))
             for label, value in shares:
                 if value is None:
                     say(f"  {label}: no patches")
@@ -369,13 +371,23 @@ def attention(q, k, v, plan, total: int, scale=None):
         break
 
 
-def _share(q, k, v, item, rows, span, scale, lse_attention) -> float:
+def _share(q, k, v, item, rows, span, scale, lse_attention, boost=0.0) -> float:
     """The softmax share of ``span``'s keys, for the given query rows.
 
     Computed from the tensors as they are, with the region's keys still in
-    them: what is wanted is what the region would be worth unmasked, so that
-    the inside and the outside numbers are the same measurement and the mask is
-    the only difference between them.
+    them: what is wanted is what the region is worth *unmasked*, so that the
+    inside and the outside numbers are the same measurement and the mask is the
+    only difference between them.
+
+    The boost has to go into the denominator as well as the numerator, or the
+    number reported is not a share of anything and can exceed one.  Raising the
+    region's keys by ``b`` multiplies their term in the softmax sum by ``e**b``
+    and leaves every other term alone, which is
+
+        lse' = lse + log1p((e**b - 1) * e**(region - lse))
+
+    done in that form because ``region`` is far below ``lse`` and the
+    subtraction is the only place this could lose its precision.
     """
 
     import math
@@ -401,6 +413,12 @@ def _share(q, k, v, item, rows, span, scale, lse_attention) -> float:
             total = torch.logsumexp(whole, dim=-1)
         else:
             total = found[1]
+
+        if boost:
+            grown = torch.log1p(
+                (math.exp(float(boost)) - 1.0) * torch.exp(region - total))
+            total = total + grown
+            region = region + float(boost)
 
         return float(torch.exp(region - total).mean())
     except Exception:

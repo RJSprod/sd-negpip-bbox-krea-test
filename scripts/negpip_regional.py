@@ -144,6 +144,26 @@ def _mode() -> str:
     return value if value in modes else "auto"
 
 
+BOOST = "negpip_regional_boost"
+"""How much of each patch's attention a region is given inside its box.
+
+Zero confines a term without making it matter, which is what the first version
+did: a region of a few tokens in a stream of thousands holds a fraction of a
+per cent of each patch's attention, and flipping the sign of a fraction of a
+per cent is a change nobody can see.  The diagnostic log measures exactly this,
+which is what the number is set against.
+"""
+
+
+def _boost() -> float:
+    try:
+        from modules import shared as _shared
+
+        return max(0.0, min(8.0, float(_shared.opts.data.get(BOOST, 0.0) or 0.0)))
+    except Exception:
+        return 0.0
+
+
 PROBE = "negpip_regional_probe"
 """Whether to write the diagnostic log; see :mod:`.probe`.
 
@@ -171,6 +191,23 @@ def _settings():
         from modules import script_callbacks, shared
 
         def register():
+            shared.opts.add_option(
+                BOOST,
+                shared.OptionInfo(
+                    0.0,
+                    "Regional NegPiP: attention boost inside a box",
+                    gr.Slider,
+                    {"minimum": 0.0, "maximum": 8.0, "step": 0.1},
+                    section=("negpip_regional", "NegPiP Regional"),
+                ).info(
+                    "added to the region's attention scores for the patches "
+                    "inside its box, in log space, so 2.3 is ten times the "
+                    "attention and 4.6 is a hundred. 0 confines the term "
+                    "without making it louder, which on a short prompt is "
+                    "usually too quiet to see -- the diagnostic log measures "
+                    "what it is actually getting"
+                ),
+            )
             shared.opts.add_option(
                 PROBE,
                 shared.OptionInfo(
@@ -378,6 +415,7 @@ class NegPiPRegional(scripts.Script):
                     return
                 if _krea2 is not None:
                     _krea2.MODE = _mode()
+                    _krea2.BOOST = _boost()
                 patch_krea2_negpip(NegPiPRegional, p.sd_model)
             else:
                 # the prompt asked for NegPiP, so say why it is not happening;
@@ -389,6 +427,8 @@ class NegPiPRegional(scripts.Script):
             p.extra_generation_params["NegPiP Regional"] = True
             if regional:
                 p.extra_generation_params["NegPiP Regional Mode"] = _mode()
+                if _boost():
+                    p.extra_generation_params["NegPiP Regional Boost"] = _boost()
             self.active = True
             print(f"NegPiP Regional Active ({model_name})")
             return

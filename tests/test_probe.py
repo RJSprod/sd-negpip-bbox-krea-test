@@ -209,3 +209,48 @@ def test_the_batch_record_says_when_it_sees_nothing(probe):
     said = read(probe)
     assert "no regions seen" in said
     assert "no negative weights" in said
+
+
+# ================================================================================ #
+# The boost, and the arithmetic it changes
+
+
+def test_a_boost_raises_the_share_and_it_stays_a_share(probe, regional):
+    """The boost belongs in the denominator too, or it is not a share at all."""
+
+    import importlib
+
+    torch.manual_seed(0)
+    plan = _plan(regional, height=6, width=5)
+    total = 12 + 30
+    q, k, v = (torch.randn(1, 4, total, 16) for _ in range(3))
+    lse = importlib.import_module(f"{PACKAGE}.regional")._lse_attention
+    rows = torch.arange(12, 30)
+    span = plan.spans[0][0]
+
+    plain = probe._share(q, k, v, 0, rows, span, None, lse, 0.0)
+    lifted = probe._share(q, k, v, 0, rows, span, None, lse, 2.3)
+    loud = probe._share(q, k, v, 0, rows, span, None, lse, 4.6)
+
+    assert 0.0 < plain < lifted < loud < 1.0
+    #  2.3 in log space is about ten times the attention, while there is room
+    assert lifted > plain * 5
+
+
+def test_the_boost_is_named_in_the_log(probe, regional):
+    torch.manual_seed(0)
+    plan = _plan(regional, height=6, width=5)
+    plan.boost = 2.5
+    total = 12 + 30
+    q, k, v = (torch.randn(2, 4, total, 16) for _ in range(3))
+    probe.attention(q, k, v, plan, total)
+    assert "boost +2.5" in read(probe)
+
+
+def test_no_boost_says_so(probe, regional):
+    torch.manual_seed(0)
+    plan = _plan(regional, height=6, width=5)
+    total = 12 + 30
+    q, k, v = (torch.randn(2, 4, total, 16) for _ in range(3))
+    probe.attention(q, k, v, plan, total)
+    assert "no boost" in read(probe)

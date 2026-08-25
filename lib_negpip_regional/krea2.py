@@ -701,8 +701,11 @@ def _plan(dit, args, kwargs, table) -> Optional["regional.Plan"]:
 
     probe.conditioning(spans, grid.txtlen)
 
-    return regional.Plan(geometry=grid, spans=spans, mode=MODE)
+    return regional.Plan(geometry=grid, spans=spans, mode=MODE, boost=BOOST)
 
+
+BOOST: float = 0.0
+"""How much louder a region's keys are inside its box; see `regional.Plan`."""
 
 MODE: str = "auto"
 """Which implementation to use; see :mod:`.regional`.

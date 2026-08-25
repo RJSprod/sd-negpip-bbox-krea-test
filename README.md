@@ -57,6 +57,23 @@ Masking the boxes downstream cannot undo that. The concept arrives everywhere th
 
 The same rule is therefore applied one stage earlier: a region's tokens are readable by that region and by nothing else. They still read the scene themselves, so the fragment is encoded knowing what picture it is in; the scene simply does not read them back.
 
+### Confining a term is not the same as making it matter
+
+A box says *where* a term applies. It does not make the term loud enough to do anything, and on a short prompt it usually is not.
+
+Measured on a real generation: a region of four tokens, in a stream of 2,843, held **0.57% of each patch's attention**. NegPiP changes the *sign* of what a term contributes, so flipping half a per cent moves the picture by about one per cent — which is nothing anybody can see, however large the weight on the embedding is. The weight scales the value; it does not buy attention.
+
+**Regional NegPiP: attention boost inside a box** buys the attention. It is added to the region's key scores for the patches inside the box, before the softmax, so it is a multiplier on what reaches them:
+
+| boost | the region's attention, inside the box |
+| --- | --- |
+| `0` | unchanged — the box confines and nothing more |
+| `2.3` | about ten times |
+| `3.9` | about fifty times |
+| `4.6` | about a hundred times |
+
+Start at `2.3` and read the log, which measures what the region is actually getting. Too much and the patches inside the box attend to little else, which looks like the box has been cut out of the picture.
+
 ### Two implementations
 
 The `Regional NegPiP` section of **Settings** chooses between them. They compute the same attention, and the test suite asserts they agree to floating-point noise; the choice is only about how much memory it takes to get there.
