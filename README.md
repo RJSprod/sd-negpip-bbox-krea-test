@@ -72,6 +72,8 @@ Measured on a real generation: a region of four tokens, in a stream of 2,843, he
 | `3.9` | about fifty times |
 | `4.6` | about a hundred times |
 
+A region owns the words written in it and not the punctuation around them, so the boost is spent on the concept rather than on commas — the log's `N token(s) ... M signed` counts are worth reading together.
+
 Start at `2.3` and read the log, which measures what the region is actually getting. Too much and the patches inside the box attend to little else, which looks like the box has been cut out of the picture.
 
 ### Two implementations

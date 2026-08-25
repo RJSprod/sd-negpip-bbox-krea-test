@@ -352,10 +352,12 @@ def _negpip_tokenize_line(self, line: str, images: list[torch.Tensor] = []):
     boxes = [None] * len(texts)
 
     for region in parsed.regions:
+        # the separator keeps the tokenizer from gluing the fragment onto the
+        # word before it, and belongs to neither
         fragments = emphasis_of(", " + region.text)
         texts += [text for text, _ in fragments]
         weights += [weight for _, weight in fragments]
-        boxes += [region.box] * len(fragments)
+        boxes += [region.box if _words(text) else None for text, _ in fragments]
 
     texts.append(suffix)
     weights.append(1.0)
@@ -383,6 +385,21 @@ def _negpip_tokenize_line(self, line: str, images: list[torch.Tensor] = []):
     # it: another Extension holding one of these has no idea what this is
     _state.boxes = chunk_boxes
     return [chunk]
+
+
+def _words(text: str) -> bool:
+    """Whether a fragment is anything more than punctuation.
+
+    A region owns the words somebody wrote in it and not the commas around
+    them.  The distinction was free while the box only confined -- a comma
+    confined to a box is a comma -- and stopped being free the moment a region
+    could be made louder inside its box: a log from a real generation showed
+    four tokens confined and one of them signed, the rest being the separator
+    prepended here and the comma the prompt ended with.  Boosting those spends
+    three quarters of the effect on punctuation.
+    """
+
+    return any(character.isalnum() for character in str(text or ""))
 
 
 def _negpip_process_embeds(self, batch_tokens):

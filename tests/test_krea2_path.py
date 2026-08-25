@@ -139,3 +139,31 @@ def test_a_table_with_no_regions_in_it_is_no_plan(krea2, regional):
     table = torch.zeros(1, 8, regional.COLUMNS)
     assert krea2._plan(dit, (torch.zeros(1, 4, 1, 64, 64), None, torch.zeros(1, 8, 8)),
                        {}, table) is None
+
+
+# ================================================================================ #
+# A region owns its words, not the punctuation around them
+
+
+def test_punctuation_is_not_part_of_a_region(krea2):
+    assert krea2._words("person")
+    assert krea2._words("a tall red lighthouse")
+    assert krea2._words("2 people")
+    assert not krea2._words(", ")
+    assert not krea2._words(",")
+    assert not krea2._words("  ")
+    assert not krea2._words("")
+    assert not krea2._words(None)
+
+
+def test_the_region_table_skips_the_separator(krea2, regional, regions):
+    """Four tokens confined and one signed is three quarters of a boost wasted."""
+
+    parsed = regions.split("a beach, REGION 0 0 0.5 1 (person:-4),")
+    #  what the fragments come out as: separator, the word, the trailing comma
+    boxes = [None] * 6 + [None, parsed.regions[0].box, None]
+
+    table = krea2._region_table(boxes, torch.zeros(9, 4, 8))
+    spans = regional.spans_from_table(table.unsqueeze(0), 9)[0]
+
+    assert [(s.start, s.length) for s in spans] == [(7, 1)]
