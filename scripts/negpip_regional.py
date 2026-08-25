@@ -117,6 +117,7 @@ patch_sd_negpip = _support("sd", "patch_sd_negpip")
 
 _krea2 = _module("krea2")
 _regional = _module("regional")
+_probe = _module("probe")
 
 SETTING = "negpip_regional_mode"
 """Which implementation to use, on the WebUI's own settings page.
@@ -143,6 +144,25 @@ def _mode() -> str:
     return value if value in modes else "auto"
 
 
+PROBE = "negpip_regional_probe"
+"""Whether to write the diagnostic log; see :mod:`.probe`.
+
+Off by default and not a debug flag anybody has to find in a file, because the
+question it answers -- why is my region not doing anything -- is the question
+every new user of this Extension has at least once, and the answer has so far
+required somebody to read attention code.
+"""
+
+
+def _probing() -> bool:
+    try:
+        from modules import shared as _shared
+
+        return bool(_shared.opts.data.get(PROBE, False))
+    except Exception:
+        return False
+
+
 def _settings():
     """Register the one setting. Never fatal: it has a working default."""
 
@@ -151,6 +171,19 @@ def _settings():
         from modules import script_callbacks, shared
 
         def register():
+            shared.opts.add_option(
+                PROBE,
+                shared.OptionInfo(
+                    False,
+                    "Regional NegPiP: write a diagnostic log",
+                    section=("negpip_regional", "NegPiP Regional"),
+                ).info(
+                    "records how each REGION line parsed, which tokens it "
+                    "became, which patches its box covers and how much of the "
+                    "image's attention those tokens command, to "
+                    f"extensions/&lt;this folder&gt;/{getattr(_probe, 'FILENAME', 'negpip_regional.log')}"
+                ),
+            )
             shared.opts.add_option(
                 SETTING,
                 shared.OptionInfo(
@@ -335,6 +368,8 @@ class NegPiPRegional(scripts.Script):
                     return
                 if _krea2 is not None:
                     _krea2.MODE = _mode()
+                if _probe is not None:
+                    _probe.enable(_probing())
                 patch_krea2_negpip(NegPiPRegional, p.sd_model)
             else:
                 # the prompt asked for NegPiP, so say why it is not happening;

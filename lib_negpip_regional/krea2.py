@@ -41,7 +41,7 @@ from backend.args import dynamic_args
 from backend.sampling import condition, sampling_function
 from modules import shared
 
-from . import regional, regions
+from . import probe, regional, regions
 
 ENGINE_METHODS: tuple[str, ...] = ("__call__", "tokenize_line", "process_embeds")
 ENGINE_REQUIREMENTS: tuple[str, ...] = ("process_tokens", "strip_template", "tokenizer")
@@ -292,6 +292,8 @@ def _encode_line(engine, line: str, images: list[torch.Tensor], signed: bool):
         b, seq, fuse = z.shape
         z = z.reshape(b * seq, layers, fuse // layers)
 
+        probe.tokens(aligned_boxes, aligned if signed else None, z.shape[0])
+
         zs.append(z)
         masks.append(_sign_mask(aligned if signed else None, z))
         tables.append(_region_table(aligned_boxes, z))
@@ -322,6 +324,7 @@ def _negpip_tokenize_line(self, line: str, images: list[torch.Tensor] = []):
     from backend.text_processing import parsing
 
     parsed = regions.split(line)
+    probe.prompt(parsed)
 
     def emphasis_of(text: str) -> list[list]:
         found = [
@@ -524,6 +527,8 @@ def _hook_get_learned_conditioning(model, remove: bool):
         _state.tables = None
         _state.reported = False
         regional.forget()
+        probe.begin("negative prompt" if getattr(
+            prompt, "is_negative_prompt", False) else "positive prompt")
         conds = original(prompt)
         masks, _state.masks = _state.masks, None
         tables, _state.tables = _state.tables, None
@@ -693,6 +698,8 @@ def _plan(dit, args, kwargs, table) -> Optional["regional.Plan"]:
     spans = regional.spans_from_table(table, grid.txtlen)
     if not any(spans):
         return None
+
+    probe.conditioning(spans, grid.txtlen)
 
     return regional.Plan(geometry=grid, spans=spans, mode=MODE)
 

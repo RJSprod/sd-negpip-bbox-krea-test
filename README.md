@@ -87,6 +87,37 @@ The package, the script, the console prefix, the conditioning keys and every att
 
 **Only one of them may be enabled.** They wrap the same four methods, and with the markers spelled differently neither recognises the other's wrapper — so the second to arrive wraps the first and every sign is applied twice. This one checks for the other's fingerprint on the model and stands down with a line on the console rather than producing an image that is wrong in a way nobody would connect to having two folders installed.
 
+## When a region does not do anything
+
+Turn on **Regional NegPiP: write a diagnostic log** in Settings. It writes `negpip_regional.log` next to this README, in the Extension's own folder, and every line also goes to the console.
+
+It answers, in order, the questions that are otherwise invisible between the prompt and the pixels:
+
+```
+prompt: 1 region(s) parsed
+  region 1  box (0.000, 0.000, 0.500, 1.000)  text '(person:-4)'
+tokens: region 1 -> 4 token(s) at 130..134 of 134, weight -4.00..-4.00
+conditioning: 2 prompt(s), 134 text token(s)
+  prompt 1: [130..134] box (0.000, 0.000, 0.500, 1.000)
+  prompt 2: no regions
+geometry: grid 64x64 = 4096 patches, 0 reference token(s), 4230 in the stream
+  region 1 covers 2048 of 4096 patches, rows 0..64, columns 0..32
+    ########################........................
+    ########################........................
+stage: text fusion masked -- 134 token(s), so the scene cannot read a region
+stage: image attention -- log-sum-exp merge
+attention on region 1:
+  inside the box : 0.412% of each patch's attention (kept)
+  outside the box: 0.395% of each patch's attention (removed by the mask)
+```
+
+- **`no REGION lines`** — the syntax did not match. The line has to start with `REGION`.
+- **`no sign to apply inside it`** — the box parsed but the term carries no negative weight, usually the `None` emphasis mode.
+- **the drawing** — the box as it actually landed on the patch grid. A shape in the wrong place here is a coordinate problem; a shape in the right place means the geometry is fine and the answer is further down.
+- **the attention share** — the number that decides whether a region *can* work. NegPiP changes the sign of what a term contributes, and the size of that change is the share of attention the term already had. A term holding a fraction of a per cent of each patch's attention, flipped, moves that patch by a fraction of a per cent, and no weight on the embedding changes that: it is a fact about the attention, not about the emphasis.
+
+The two shares also tell you the mask is real. The outside number is what the region *would* have been worth to a patch outside the box, and the mask takes all of it away; the inside number is what the sign has to work with.
+
 ## Console
 
 The Extension reports what it did, so that nothing it decided is silent:

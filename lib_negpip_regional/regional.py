@@ -80,7 +80,7 @@ from typing import Callable, Optional
 
 import torch
 
-from . import regions
+from . import probe, regions
 
 COLUMNS = 5
 """Width of the per-token region table: a flag and four coordinates.
@@ -728,7 +728,9 @@ def attend(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False,
     total = q.shape[2]
 
     if _is_fusion(plan, total, q.shape[0]):
-        _report(plan, "fusion", total)
+        if _report(plan, "fusion", total):
+            probe.stage("text fusion masked",
+                        f"{total} token(s), so the scene cannot read a region")
         return _masked_backend(original)(
             q, k, v, heads,
             mask=fusion_mask(plan, total, q.shape[0], q.device, q.dtype),
@@ -745,14 +747,20 @@ def attend(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False,
     if plan.mode != "dense":
         merged = merged_attention(q, k, v, plan, total, scale, original)
         if merged is not None:
-            _report(plan, "merge", total)
+            if _report(plan, "merge", total):
+                probe.geometry(plan, total)
+                probe.stage("image attention", "log-sum-exp merge")
+                probe.attention(q, k, v, plan, total, scale)
             return _reshaped(merged, heads, skip_output_reshape)
         if plan.mode == "merge":
             # asked for by name, so say why it is not what is running
             print("NegPiP Regional: no log-sum-exp from this attention build, "
                   "falling back to the dense mask")
 
-    _report(plan, "dense", total)
+    if _report(plan, "dense", total):
+        probe.geometry(plan, total)
+        probe.stage("image attention", "dense mask")
+        probe.attention(q, k, v, plan, total, scale)
     bias = dense_mask(plan, total, q.shape[0], q.device, q.dtype)
     return _masked_backend(original)(
         q, k, v, heads, mask=bias, attn_precision=attn_precision,
@@ -796,8 +804,12 @@ def _is_fusion(plan: Plan, total: int, batch: int) -> bool:
             and total == plan.geometry.txtlen)
 
 
-def _report(plan: Plan, how: str, total: int):
+def _report(plan: Plan, how: str, total: int) -> bool:
     """One line per generation saying the regions reached attention.
+
+    Returns whether this was the first time for this stage, which is also when
+    the probe -- if it is on -- should do its measuring: once, on real tensors,
+    rather than on every block of every step.
 
     The failure this fork is most likely to have is the quiet one -- a mask
     built for a geometry that is not the one being sampled, applied to nothing
@@ -806,7 +818,7 @@ def _report(plan: Plan, how: str, total: int):
     """
 
     if how in _reported:
-        return
+        return False
     _reported.add(how)
 
     counted = sum(len(row) for row in plan.spans)
@@ -818,6 +830,7 @@ def _report(plan: Plan, how: str, total: int):
         f"NegPiP Regional Applied ({counted} region(s), {tokens} token(s), "
         f"{how}: {where}, {total} in the stream)"
     )
+    return True
 
 
 attend._negpip_regional = True
