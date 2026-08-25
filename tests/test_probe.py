@@ -254,3 +254,32 @@ def test_no_boost_says_so(probe, regional):
     q, k, v = (torch.randn(2, 4, total, 16) for _ in range(3))
     probe.attention(q, k, v, plan, total)
     assert "no boost" in read(probe)
+
+
+def test_the_prompts_whole_share_is_reported(probe, regional):
+    """The ceiling on any prompt-side change, which puts the rest in proportion."""
+
+    torch.manual_seed(0)
+    plan = _plan(regional, height=6, width=5)
+    total = 12 + 30
+    q, k, v = (torch.randn(2, 4, total, 16) for _ in range(3))
+
+    probe.attention(q, k, v, plan, total)
+    said = read(probe)
+    assert "the whole prompt (12 tokens) holds" in said
+    assert "the image looking at itself" in said
+
+
+def test_the_whole_prompt_share_exceeds_one_regions(probe, regional):
+    import importlib
+
+    torch.manual_seed(0)
+    plan = _plan(regional, height=6, width=5)
+    total = 12 + 30
+    q, k, v = (torch.randn(1, 4, total, 16) for _ in range(3))
+    lse = importlib.import_module(f"{PACKAGE}.regional")._lse_attention
+    rows = torch.arange(12, 30)
+
+    region = probe._share(q, k, v, 0, rows, plan.spans[0][0], None, lse)
+    whole = probe._share(q, k, v, 0, rows, probe._Whole(12), None, lse)
+    assert region < whole < 1.0

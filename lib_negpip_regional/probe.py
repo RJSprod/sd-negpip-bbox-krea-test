@@ -359,6 +359,9 @@ def attention(q, k, v, plan, total: int, scale=None):
 
             say(f"attention on region {number}:"
                 + (f" boost {plan.boost:+.1f}" if plan.boost else " no boost"))
+
+            _ceiling(q, k, v, item, rows_in, grid.txtlen, scale, _lse_attention)
+
             for label, value in shares:
                 if value is None:
                     say(f"  {label}: no patches")
@@ -369,6 +372,46 @@ def attention(q, k, v, plan, total: int, scale=None):
                     say(f"  {label}: {value * 100:.3f}% of each patch's "
                         f"attention ({kept})")
         break
+
+
+class _Whole:
+    """The entire text block, as something :func:`_share` can measure."""
+
+    def __init__(self, txtlen: int):
+        self.start = 0
+        self.stop = int(txtlen)
+
+
+def _ceiling(q, k, v, item, rows, txtlen: int, scale, lse_attention):
+    """How much of a patch's attention goes to the prompt at all.
+
+    The number that puts every other number here in proportion, and the one
+    that is easy to forget exists.  A single-stream transformer attends over
+    text, references and the image together, and the overwhelming majority of
+    what an image patch looks at is other image patches.  Whatever share the
+    prompt holds is the ceiling on what *any* prompt-side intervention can do
+    -- a sign flip, a weight, a region, all of it -- because none of them can
+    change a patch by more than the attention it was paying in the first place.
+
+    If this reads a few per cent, then a term inside it holding a fraction of a
+    per cent is not a bug in this Extension.  It is the architecture, and the
+    boost exists precisely to buy back some of the difference.
+    """
+
+    if rows.numel() == 0:
+        return
+
+    picked = rows[torch.linspace(
+        0, rows.numel() - 1, min(SAMPLE, rows.numel()),
+        device=rows.device).long()]
+
+    share = _share(q, k, v, item, picked, _Whole(txtlen), scale, lse_attention)
+    if share < 0:
+        return
+
+    say(f"  the whole prompt ({txtlen} tokens) holds {share * 100:.2f}% of "
+        f"each patch's attention -- the rest is the image looking at itself, "
+        f"and no prompt-side change can exceed it")
 
 
 def _share(q, k, v, item, rows, span, scale, lse_attention, boost=0.0) -> float:
