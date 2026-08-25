@@ -46,6 +46,14 @@ Krea 2 makes the geometry free. Its single-stream blocks attend over `[context |
 
 So the region's tokens are appended to the prompt, and the tokens outside the box are stopped from attending to them. Inside the box, the sign applies as it always did. Outside, the concept does not exist — neither added nor subtracted.
 
+### The stage before that one
+
+The single-stream blocks are not the first attention a prompt goes through. `TextFusionTransformer` ends with two blocks of **full self-attention across the token axis**, and a region appended to the prompt is an ordinary token to them: its content is blended into the scene's tokens before the image is attended over at all, and the scene's tokens are read by every patch in the picture.
+
+Masking the boxes downstream cannot undo that. The concept arrives everywhere through the fused scene, at the magnitude it was encoded at and with the sign that is only flipped at the region's own positions — so a negative region reads as a picture violently perturbed and not at all negated.
+
+The same rule is therefore applied one stage earlier: a region's tokens are readable by that region and by nothing else. They still read the scene themselves, so the fragment is encoded knowing what picture it is in; the scene simply does not read them back.
+
 ### Two implementations
 
 The `Regional NegPiP` section of **Settings** chooses between them. They compute the same attention, and the test suite asserts they agree to floating-point noise; the choice is only about how much memory it takes to get there.
@@ -88,10 +96,13 @@ The Extension reports what it did, so that nothing it decided is silent:
 | `NegPiP Regional Loaded` | it is installed and being called, listing the models it can handle |
 | `NegPiP Regional Active` | it engaged, naming the model it recognised |
 | `NegPiP Regional Enable` | how many tokens are signed, and how many are confined to a box |
-| `NegPiP Regional Applied` | the regions reached the transformer, with the patch grid they were built for |
+| `NegPiP Regional Applied` | the regions reached the transformer, with the patch grid they were built for; `fusion` names the text stage, `merge` or `dense` the image stage |
 | `NegPiP Regional Disabled` | it stood down, and why |
 
 Nothing at all for a prompt that contains a `REGION` line or a `(foo:-1.0)` means neither was recognised.
+
+> [!WARNING]
+> The weight is applied to the **input embedding** at its magnitude, and the sign is carried separately. `(man:-3)` therefore encodes "man" with three times the usual emphasis and then subtracts it; `(man:-30)` encodes something thirty times over, which is far outside the range the text encoder was trained on and produces a distorted concept rather than a strong one. Stay in single digits.
 
 > [!TIP]
 > On Krea 2 the weight is a dial, not a switch. A single-stream transformer attends over the reference and image streams as well, so one text token carries far less of the attention than it does in SD, and `-1.0` can be too subtle to see. Turn it up until the concept goes.

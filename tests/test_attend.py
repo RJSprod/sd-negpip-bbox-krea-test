@@ -96,13 +96,18 @@ def test_with_no_plan_the_call_goes_straight_through(regional, host):
         regional.install(True)
 
 
-def test_the_text_fusion_blocks_are_left_alone(regional, host):
-    """Their sequence is the prompt alone, which cannot hold an image grid."""
+def test_the_layerwise_fusion_stack_is_left_alone(regional, host):
+    """It folds the tokens into the batch and attends over the tapped layers.
+
+    A token index means nothing on that axis, so the mask must not land there.
+    The refiner blocks, which attend over the tokens, are masked -- see
+    `test_the_fusion_attention_is_masked_when_the_batch_says_it_is`.
+    """
 
     regional.install(False)
     regional.begin(_plan(regional))
     try:
-        q, k, v = _qkv(12)
+        q, k, v = _qkv(4, batch=2 * 12)
         assert torch.equal(
             host.attention_function(q, k, v, 4, skip_reshape=True),
             plain_attention(q, k, v, 4, skip_reshape=True),
@@ -178,6 +183,23 @@ def test_the_dense_path_steps_around_the_flash_backend(regional, host):
         #  the fixture's flash fails the test if it is handed a mask
         out = host.attention_function(q, k, v, 4, skip_reshape=True)
         assert out.shape == (2, total, 4 * 16)
+    finally:
+        regional.end()
+        regional.install(True)
+
+
+def test_the_fusion_attention_is_masked_when_the_batch_says_it_is(regional, host):
+    """`refiner_blocks` attend over the tokens, and a region must not be read."""
+
+    regional.install(False)
+    plan = _plan(regional)
+    regional.begin(plan)
+    try:
+        q, k, v = _qkv(12)
+        out = host.attention_function(q, k, v, 4, skip_reshape=True)
+        plain = plain_attention(q, k, v, 4, skip_reshape=True)
+        assert out.shape == plain.shape
+        assert not torch.allclose(out, plain)
     finally:
         regional.end()
         regional.install(True)

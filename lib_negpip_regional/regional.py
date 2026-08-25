@@ -62,9 +62,14 @@ One patch point
 and is hard-coded to ``None``, so there is nothing to pass a mask *into*.
 Rather than wrap every block and every attention module, this replaces the
 ``attention_function`` name in that module with :func:`attend`, which reads the
-plan for the forward that is running.  One name, restored on unpatch, and the
-text fusion blocks -- whose sequence is the text alone -- fall out of it by
-length, since their ``L`` cannot contain an image grid.
+plan for the forward that is running.  One name, restored on unpatch, and every
+attention in the model reached through it.
+
+Which matters more than it first looks, because the single-stream blocks are
+not the first attention a prompt goes through.  ``TextFusionTransformer`` ends
+with two blocks of full self-attention across the token axis, where a region
+appended to the prompt is an ordinary token whose content is blended into the
+scene before the image is attended over at all -- see :func:`fusion_mask`.
 """
 
 from __future__ import annotations
@@ -142,6 +147,17 @@ class Plan:
     @property
     def active(self) -> bool:
         return any(self.spans)
+
+    @property
+    def prompts(self) -> int:
+        """How many prompts this forward is conditioning on.
+
+        The region table arrives as ``[B, T, 5]`` and is read into one list of
+        spans per row, so the batch is the length of that list and needs no
+        second source.  It is worth having a name because it is what tells
+        Krea 2's two text fusion stacks apart -- see :func:`_is_fusion`.
+        """
+        return len(self.spans)
 
 
 _plan: Optional[Plan] = None
@@ -354,6 +370,44 @@ def _call_by_schema(op, q, k, v, scale):
             values.append(value)
 
     return op(*values, **keywords)
+
+
+def fusion_mask(plan: Plan, total: int, batch: int, device, dtype):
+    """The mask for Krea 2's text fusion, where a region would otherwise leak.
+
+    The single-stream blocks are not the first attention a prompt goes through.
+    `TextFusionTransformer` ends with two blocks of full self-attention across
+    the token axis, and a region appended to the prompt is an ordinary token to
+    them: its content is blended into the scene's tokens before the image is
+    ever attended over, and the scene's tokens are read by every patch in the
+    picture.
+
+    Masking the boxes downstream cannot undo that.  The concept arrives
+    everywhere through the fused scene, at the magnitude it was encoded at and
+    with the sign the mask only flips at the region's own positions -- so a
+    negative region reads as a picture violently perturbed and not at all
+    negated, which is exactly what it did.
+
+    So the same rule is applied one stage earlier: a region's tokens are
+    readable by that region and by nothing else.  They still read the scene
+    themselves, so the fragment is encoded knowing what picture it is in; the
+    scene simply does not read them back.  The sequence here is the prompt, so
+    this mask is a few hundred numbers square and there is nothing to optimise.
+    """
+
+    bias = torch.zeros(batch, 1, total, total, device=device, dtype=dtype)
+    blocked = _neutral(dtype)
+
+    for index in range(batch):
+        spans = plan.spans[index % len(plan.spans)] if plan.spans else []
+        for span in spans:
+            if span.length <= 0 or span.start >= total:
+                continue
+            stop = min(span.stop, total)
+            bias[index, 0, :, span.start:stop] = blocked
+            bias[index, 0, span.start:stop, span.start:stop] = 0.0
+
+    return bias
 
 
 def _lse_attention(q, k, v, scale=None):
@@ -578,46 +632,6 @@ def _merge_item(q, k, v, spans: list[Span], plan: Plan, total: int, scale,
     return base_out.clone().index_copy_(1, inside, merged)
 
 
-def _shared_spans(per_item: list[list[Span]]) -> list[Span]:
-    """Every distinct span in the batch, by position.
-
-    Prompts in one batch are padded to a common length and the regions of the
-    positive and the negative prompt need not line up, so a span is attended for
-    the whole batch and switched off, per item, in :func:`_allowed_stack`.
-    """
-
-    seen: dict[tuple[int, int], Span] = {}
-    for row in per_item:
-        for span in row:
-            seen.setdefault((span.start, span.stop), span)
-    return [seen[key] for key in sorted(seen)]
-
-
-def _allowed_stack(span: Span, per_item, plan: Plan, total: int, device):
-    """``[B, L]`` of the queries each batch item lets this span reach.
-
-    A batch item with no region at these positions is not a region switched
-    off: prompts in a batch are padded to a common length, so the same indices
-    are ordinary text in the negative prompt while they are a box in the
-    positive one.  Ordinary text is visible to everything, so the row is all
-    true -- and the split then adds back exactly the keys it took out, which is
-    why an unregioned prompt in a regioned batch comes out bit-for-bit as it
-    would have without this Extension.
-    """
-
-    rows = []
-    for spans in per_item:
-        mine = next(
-            (s for s in spans if s.start == span.start and s.stop == span.stop),
-            None,
-        )
-        if mine is None:
-            rows.append(torch.ones(total, dtype=torch.bool, device=device))
-        else:
-            rows.append(query_rows(mine, plan.geometry, total, device))
-    return torch.stack(rows, dim=0)
-
-
 # ================================================================================ #
 # The seam
 
@@ -693,10 +707,12 @@ def attend(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False,
            skip_output_reshape=False, **kwargs):
     """``attention_function``, with the regions of the running forward applied.
 
-    Signature is the one every backend in ``backend/attention.py`` shares, and
-    every path that is not a regional single-stream attention is handed to the
-    function this one replaced -- including the text fusion blocks, whose
-    sequence is the prompt alone and so cannot hold an image grid.
+    Signature is the one every backend in ``backend/attention.py`` shares.
+    Three things can arrive here and they are told apart by shape: the text
+    fusion refiner blocks, whose sequence is the prompt and whose batch is the
+    prompts (:func:`fusion_mask`); the single-stream blocks, whose sequence is
+    text, references and the image grid together; and everything else, which is
+    handed to the function this one replaced.
     """
 
     original = _originals.get("attention_function")
@@ -710,6 +726,15 @@ def attend(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False,
                         skip_output_reshape=skip_output_reshape, **kwargs)
 
     total = q.shape[2]
+
+    if _is_fusion(plan, total, q.shape[0]):
+        _report(plan, "fusion", total)
+        return _masked_backend(original)(
+            q, k, v, heads,
+            mask=fusion_mask(plan, total, q.shape[0], q.device, q.dtype),
+            attn_precision=attn_precision, skip_reshape=True,
+            skip_output_reshape=skip_output_reshape, **kwargs)
+
     if not plan.geometry.holds(total):
         return original(q, k, v, heads, mask=None, attn_precision=attn_precision,
                         skip_reshape=True, skip_output_reshape=skip_output_reshape,
@@ -734,19 +759,41 @@ def attend(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False,
         skip_reshape=True, skip_output_reshape=skip_output_reshape, **kwargs)
 
 
-_reported: bool = False
-"""Whether this generation has already said the regions reached attention.
+_reported: set = set()
+"""Which stages this generation has already reported reaching.
 
 Module level and not on the plan: the plan is rebuilt on every forward, because
 the patch grid it addresses is only known once the latent for that step is in
 hand, so a flag living on it would say the line thirty times an image.
+
+A set and not a flag because the two stages are two different facts.  Text
+fusion is the first attention of the forward, so a single flag would be spent
+there and the image stage -- the one somebody is actually asking about when a
+region does not work -- would never say anything at all.
 """
 
 
 def forget():
-    """Let the next generation say its line again."""
-    global _reported
-    _reported = False
+    """Let the next generation say its lines again."""
+    _reported.clear()
+
+
+def _is_fusion(plan: Plan, total: int, batch: int) -> bool:
+    """Whether this is the text fusion stack's own attention over the tokens.
+
+    The sequence has to be the prompt.  That alone is what tells the refiner
+    blocks from the layerwise ones, which fold the tokens into the batch and
+    attend over the tapped layers instead: their sequence is the handful of
+    layers the text engine taps, so a token index there would mean something
+    else entirely.  The batch is required to be the prompts exactly, and not
+    merely a multiple of them: a build whose tapped-layer count happened to
+    equal the prompt length would otherwise satisfy both halves at once, and
+    the mask would land on the wrong axis with every index still in range.
+    """
+
+    return (plan.prompts > 0
+            and batch == plan.prompts
+            and total == plan.geometry.txtlen)
 
 
 def _report(plan: Plan, how: str, total: int):
@@ -758,19 +805,18 @@ def _report(plan: Plan, how: str, total: int):
     Extension that is not installed.
     """
 
-    global _reported
-
-    if _reported:
+    if how in _reported:
         return
-    _reported = True
+    _reported.add(how)
 
     counted = sum(len(row) for row in plan.spans)
     tokens = sum(span.length for row in plan.spans for span in row)
     geometry = plan.geometry
+    where = ("text fusion" if how == "fusion"
+             else f"{geometry.height}x{geometry.width} patches")
     print(
         f"NegPiP Regional Applied ({counted} region(s), {tokens} token(s), "
-        f"{how}: {geometry.height}x{geometry.width} patches, "
-        f"{total} in the stream)"
+        f"{how}: {where}, {total} in the stream)"
     )
 
 

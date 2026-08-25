@@ -219,3 +219,60 @@ def test_only_the_text_block_is_read(regional):
     table[0, 12:14, 0] = 1.0
     table[0, 12:14, 1:] = torch.tensor([0.0, 0.0, 1.0, 0.5])
     assert regional.spans_from_table(table, 12)[0] == []
+
+
+# ================================================================================ #
+# Text fusion, which runs before any of the above
+
+
+def test_the_fusion_mask_stops_the_scene_reading_a_region(regional):
+    """The leak that made a regional negative perturb everything and negate nothing."""
+
+    plan = _plan(regional, [[_span(regional, 8, 2, (0.0, 0.0, 1.0, 0.4))]])
+    bias = regional.fusion_mask(plan, 12, 1, "cpu", torch.float32)
+    blocked = torch.finfo(torch.float32).min
+
+    #  no scene token may read the region's tokens
+    assert float(bias[0, 0, 0, 8]) == blocked
+    assert float(bias[0, 0, 7, 9]) == blocked
+    #  the region reads itself, so the fragment is still encoded as a phrase
+    assert float(bias[0, 0, 8, 9]) == 0.0
+    #  and it still reads the scene, so it knows what picture it is in
+    assert float(bias[0, 0, 8, 0]) == 0.0
+    #  nothing else is touched
+    assert float(bias[0, 0, :, :8].abs().max()) == 0.0
+
+
+def test_two_regions_do_not_read_each_other_in_fusion(regional):
+    plan = _plan(regional, [[
+        _span(regional, 8, 2, (0.0, 0.0, 1.0, 0.4)),
+        _span(regional, 10, 2, (0.5, 0.5, 1.0, 1.0)),
+    ]])
+    bias = regional.fusion_mask(plan, 12, 1, "cpu", torch.float32)
+    blocked = torch.finfo(torch.float32).min
+
+    assert float(bias[0, 0, 8, 10]) == blocked
+    assert float(bias[0, 0, 10, 8]) == blocked
+    assert float(bias[0, 0, 10, 11]) == 0.0
+
+
+def test_the_refiner_blocks_are_recognised_and_the_layerwise_ones_are_not(regional):
+    """Both reach the patched function with a sequence that is not the stream."""
+
+    #  one row of the region table per prompt, so the plan knows the batch
+    plan = _plan(regional, [[_span(regional, 8, 2, (0.0, 0.0, 1.0, 0.4))], []])
+
+    #  the refiner attends over the tokens, with the batch as itself
+    assert regional._is_fusion(plan, 12, 2)
+    #  the layerwise stack folds the tokens into the batch and attends over the
+    #  tapped layers, where a token index would mean something else entirely
+    assert not regional._is_fusion(plan, 4, 2 * 12)
+    assert not regional._is_fusion(plan, 12, 2 * 12)
+    #  and the combined stream is not fusion at all
+    assert not regional._is_fusion(plan, 12 + 30, 2)
+
+
+def test_a_plan_with_no_prompts_in_it_masks_no_fusion(regional):
+    plan = _plan(regional, [])
+    assert plan.prompts == 0
+    assert not regional._is_fusion(plan, 12, 2)

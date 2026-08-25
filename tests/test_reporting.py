@@ -40,3 +40,17 @@ def test_the_line_names_the_grid_it_was_built_for(regional, capsys):
     assert "6x5 patches" in said
     assert "1 region(s), 2 token(s), dense" in said
     assert "42 in the stream" in said
+
+
+def test_both_stages_get_a_line_of_their_own(regional, capsys):
+    """Text fusion is the first attention, and would spend a single flag."""
+
+    regional.forget()
+    for _ in range(3):
+        regional._report(_plan(regional), "fusion", 12)
+        regional._report(_plan(regional), "merge", 42)
+
+    said = capsys.readouterr().out.strip().splitlines()
+    assert len(said) == 2
+    assert "fusion: text fusion" in said[0]
+    assert "merge: 6x5 patches" in said[1]
